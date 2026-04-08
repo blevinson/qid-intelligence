@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qid-intelligence
+  namespace: qid
+  labels:
+    app: qid-intelligence
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qid-intelligence
+  template:
+    metadata:
+      labels:
+        app: qid-intelligence
+    spec:
+      containers:
+        - name: qid-intelligence
+          image: ghcr.io/blevinson/qid-intelligence:latest
+          ports:
+            - containerPort: 5001
+              name: http
+          env:
+            - name: LLM_API_KEY
+              value: "sk-proxy"
+            - name: LLM_BASE_URL
+              value: "http://azure-anthropic-proxy.cloudtorch.svc.cluster.local:4000/v1"
+            - name: LLM_MODEL_NAME
+              value: "gpt-5.4-mini"
+            - name: NEO4J_URI
+              value: "bolt://neo4j.qid.svc.cluster.local:7687"
+            - name: NEO4J_USER
+              value: "neo4j"
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: neo4j-credentials
+                  key: NEO4J_AUTH
+            - name: GRAPHITI_GROUP_ID
+              value: "qid_intelligence"
+            - name: FLASK_DEBUG
+              value: "False"
+            - name: FLASK_PORT
+              value: "5001"
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5001
+            initialDelaySeconds: 15
+            periodSeconds: 60
+      imagePullSecrets:
+        - name: ghcr-pull
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qid-intelligence
+  namespace: qid
+  labels:
+    app: qid-intelligence
+spec:
+  selector:
+    app: qid-intelligence
+  ports:
+    - name: http
+      port: 5001
+      targetPort: 5001
+  type: ClusterIP

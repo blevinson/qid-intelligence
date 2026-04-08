@@ -15,7 +15,7 @@ openai>=1.0.0
 
 # ============= Knowledge Graph (Graphiti + Neo4j) =============
 graphiti-core>=0.28.0
-neo4j>=5.26.0
+neo4j>=5.23.0
 
 # ============= OASIS 社交媒体模拟 =============
 # OASIS 社交模拟框架

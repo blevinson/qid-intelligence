@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY backend/requirements.txt .
+
+# Install in two stages to resolve neo4j version conflict:
+# graphiti-core needs neo4j>=5.26, camel-oasis pins neo4j==5.23
+RUN pip install --no-cache-dir \
+    flask>=3.0.0 flask-cors>=6.0.0 openai>=1.0.0 \
+    graphiti-core>=0.28.0 neo4j>=5.26.0 psycopg2-binary>=2.9.0 \
+    PyMuPDF>=1.24.0 charset-normalizer>=3.0.0 chardet>=5.0.0 \
+    python-dotenv>=1.0.0 pydantic>=2.0.0 gunicorn \
+ && pip install --no-cache-dir --no-deps camel-oasis==0.2.5 \
+ && pip install --no-cache-dir camel-ai==0.2.78
+
+COPY backend/ .
+COPY locales/ /locales/
+
+EXPOSE 5001
+
+ENV PYTHONUNBUFFERED=1
+ENV FLASK_PORT=5001
+ENV FLASK_DEBUG=False
+
+CMD ["python", "run.py"]

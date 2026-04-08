@@ -35,7 +35,9 @@ class Config:
     # Graphiti / Neo4j configuration
     NEO4J_URI = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
     NEO4J_USER = os.environ.get('NEO4J_USER', 'neo4j')
-    NEO4J_PASSWORD = os.environ.get('NEO4J_PASSWORD', 'password')
+    # NEO4J_AUTH secret may be in "neo4j/password" format
+    _raw_neo4j_pw = os.environ.get('NEO4J_PASSWORD', 'password')
+    NEO4J_PASSWORD = _raw_neo4j_pw.split('/', 1)[1] if '/' in _raw_neo4j_pw else _raw_neo4j_pw
     GRAPHITI_GROUP_ID = os.environ.get('GRAPHITI_GROUP_ID', 'qid_intelligence')
     
     # 文件上传配置

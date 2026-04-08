@@ -88,9 +88,8 @@ def regime_entities():
     Get all entities in the knowledge graph.
     Returns entity names and types.
     """
-    graphiti = _get_graphiti()
-    if not graphiti:
-        return jsonify({"error": "Graphiti not configured"}), 503
+    if not Config.NEO4J_URI:
+        return jsonify({"error": "NEO4J_URI not configured"}), 503
 
     from neo4j import GraphDatabase
     driver = GraphDatabase.driver(
