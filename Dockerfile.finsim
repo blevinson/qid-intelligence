@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    graphiti-core>=0.28.0 \
+    neo4j>=5.26.0 \
+    psycopg2-binary>=2.9.0 \
+    openai>=1.0.0
+
+COPY backend/app/services/financial_personas.py app/services/financial_personas.py
+COPY backend/financial_simulation.py .
+
+ENV PYTHONUNBUFFERED=1
+CMD ["python", "financial_simulation.py"]
