@@ -75,34 +75,40 @@ class FilteredEntities:
 
 class ZepEntityReader:
     """
-    Entity reader using Graphiti + local Neo4j.
+    Entity reader using sync Neo4j driver.
     Class name preserved for backward compatibility.
     """
 
     def __init__(self, api_key: Optional[str] = None):
-        # api_key param kept for backward compat but ignored
-        self._graphiti: Optional[Graphiti] = None
+        self._driver = None
 
-    def _get_graphiti(self) -> Graphiti:
-        if self._graphiti is None:
-            self._graphiti = Graphiti(
+    def _get_driver(self):
+        if self._driver is None:
+            from neo4j import GraphDatabase
+            self._driver = GraphDatabase.driver(
                 Config.NEO4J_URI,
-                Config.NEO4J_USER,
-                Config.NEO4J_PASSWORD,
+                auth=(Config.NEO4J_USER, Config.NEO4J_PASSWORD),
             )
-        return self._graphiti
+        return self._driver
+
+    def _query(self, cypher: str, **params) -> List[Dict[str, Any]]:
+        driver = self._get_driver()
+        try:
+            with driver.session() as session:
+                result = session.run(cypher, **params)
+                return [dict(r) for r in result]
+        except Exception as e:
+            logger.error(f"Neo4j query error: {e}")
+            return []
 
     def get_all_nodes(self, graph_id: str) -> List[Dict[str, Any]]:
         logger.info(f"Fetching all nodes for graph {graph_id}")
-        graphiti = self._get_graphiti()
-        records = _run_async(
-            graphiti.driver.execute_query(
-                "MATCH (n:Entity) RETURN n.uuid as uuid, n.name as name, "
-                "labels(n) as labels, n.summary as summary LIMIT 2000"
-            )
+        records = self._query(
+            "MATCH (n:Entity) RETURN n.uuid as uuid, n.name as name, "
+            "labels(n) as labels, n.summary as summary LIMIT 2000"
         )
         nodes_data = []
-        for r in (records or []):
+        for r in records:
             nodes_data.append({
                 "uuid": r.get("uuid", ""),
                 "name": r.get("name", ""),
@@ -115,16 +121,13 @@ class ZepEntityReader:
 
     def get_all_edges(self, graph_id: str) -> List[Dict[str, Any]]:
         logger.info(f"Fetching all edges for graph {graph_id}")
-        graphiti = self._get_graphiti()
-        records = _run_async(
-            graphiti.driver.execute_query(
-                "MATCH (s)-[r:RELATES_TO]->(t) "
-                "RETURN r.uuid as uuid, r.name as name, r.fact as fact, "
-                "s.uuid as source_uuid, t.uuid as target_uuid LIMIT 5000"
-            )
+        records = self._query(
+            "MATCH (s:Entity)-[r]->(t:Entity) "
+            "RETURN r.uuid as uuid, type(r) as name, r.fact as fact, "
+            "s.uuid as source_uuid, t.uuid as target_uuid LIMIT 5000"
         )
         edges_data = []
-        for r in (records or []):
+        for r in records:
             edges_data.append({
                 "uuid": r.get("uuid", ""),
                 "name": r.get("name", ""),
@@ -137,30 +140,23 @@ class ZepEntityReader:
         return edges_data
 
     def get_node_edges(self, node_uuid: str) -> List[Dict[str, Any]]:
-        graphiti = self._get_graphiti()
-        try:
-            records = _run_async(
-                graphiti.driver.execute_query(
-                    "MATCH (n {uuid: $uuid})-[r]-(m) "
-                    "RETURN r.uuid as uuid, type(r) as name, r.fact as fact, "
-                    "startNode(r).uuid as source_uuid, endNode(r).uuid as target_uuid",
-                    {"uuid": node_uuid},
-                )
-            )
-            return [
-                {
-                    "uuid": r.get("uuid", ""),
-                    "name": r.get("name", ""),
-                    "fact": r.get("fact", ""),
-                    "source_node_uuid": r.get("source_uuid", ""),
-                    "target_node_uuid": r.get("target_uuid", ""),
-                    "attributes": {},
-                }
-                for r in (records or [])
-            ]
-        except Exception as e:
-            logger.warning(f"Failed to get edges for node {node_uuid[:8]}: {e}")
-            return []
+        records = self._query(
+            "MATCH (n {uuid: $uuid})-[r]-(m) "
+            "RETURN r.uuid as uuid, type(r) as name, r.fact as fact, "
+            "n.uuid as source_uuid, m.uuid as target_uuid",
+            uuid=node_uuid,
+        )
+        return [
+            {
+                "uuid": r.get("uuid", ""),
+                "name": r.get("name", ""),
+                "fact": r.get("fact", ""),
+                "source_node_uuid": r.get("source_uuid", ""),
+                "target_node_uuid": r.get("target_uuid", ""),
+                "attributes": {},
+            }
+            for r in records
+        ]
 
     def filter_defined_entities(
         self,
@@ -259,15 +255,12 @@ class ZepEntityReader:
         entity_uuid: str,
     ) -> Optional[EntityNode]:
         """Get a single entity with all its edges and related nodes."""
-        graphiti = self._get_graphiti()
         try:
-            records = _run_async(
-                graphiti.driver.execute_query(
-                    "MATCH (n {uuid: $uuid}) "
-                    "RETURN n.uuid as uuid, n.name as name, labels(n) as labels, "
-                    "n.summary as summary",
-                    {"uuid": entity_uuid},
-                )
+            records = self._query(
+                "MATCH (n {uuid: $uuid}) "
+                "RETURN n.uuid as uuid, n.name as name, labels(n) as labels, "
+                "n.summary as summary",
+                uuid=entity_uuid,
             )
             if not records:
                 return None
