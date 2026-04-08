@@ -47,12 +47,132 @@ class GraphBuilderService:
 
     def _get_graphiti(self) -> Graphiti:
         if self._graphiti is None:
+            from graphiti_core.llm_client.openai_client import OpenAIClient
+            from graphiti_core.llm_client.config import LLMConfig
+            from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+
+            llm_config = LLMConfig(
+                api_key=Config.LLM_API_KEY or None,
+                model=Config.LLM_MODEL_NAME or "gpt-5.4-mini",
+                small_model=Config.LLM_MODEL_NAME or "gpt-5.4-mini",
+                base_url=Config.LLM_BASE_URL or None,
+            )
+            embedder_config = OpenAIEmbedderConfig(
+                api_key=Config.LLM_API_KEY or None,
+                base_url=Config.LLM_BASE_URL or None,
+            )
             self._graphiti = Graphiti(
                 Config.NEO4J_URI,
                 Config.NEO4J_USER,
                 Config.NEO4J_PASSWORD,
+                llm_client=OpenAIClient(config=llm_config),
+                embedder=OpenAIEmbedder(config=embedder_config),
             )
         return self._graphiti
+
+    # --- Compatibility methods for MiroFish API endpoints ---
+
+    def create_graph(self, name: str = "default") -> str:
+        """Create a graph partition. Returns group_id."""
+        return Config.GRAPHITI_GROUP_ID
+
+    def set_ontology(self, graph_id: str, ontology: Dict[str, Any]):
+        """Ontology is advisory in Graphiti -- store for reference only."""
+        pass
+
+    def add_text_chunks(
+        self,
+        graph_id: str,
+        chunks: List[str],
+        progress_callback: Optional[Callable] = None,
+    ):
+        """Ingest text chunks as Graphiti episodes."""
+        loop = asyncio.new_event_loop()
+        graphiti = self._get_graphiti()
+        total = len(chunks)
+        for i, chunk in enumerate(chunks):
+            loop.run_until_complete(
+                graphiti.add_episode(
+                    name=f"chunk_{i}",
+                    episode_body=chunk,
+                    source=EpisodeType.text,
+                    source_description=f"Text chunk {i+1}/{total}",
+                    reference_time=datetime.now(timezone.utc),
+                    group_id=graph_id,
+                )
+            )
+            if progress_callback:
+                progress_callback(f"Ingested chunk {i+1}/{total}", (i + 1) / total)
+        loop.close()
+
+    def add_text_batches(
+        self,
+        graph_id: str,
+        chunks: List[str],
+        batch_size: int = 3,
+        progress_callback: Optional[Callable] = None,
+    ) -> List[str]:
+        """Ingest text chunks as Graphiti episodes. Returns fake episode UUIDs."""
+        self.add_text_chunks(graph_id, chunks, progress_callback)
+        return [f"ep_{i}" for i in range(len(chunks))]
+
+    def _wait_for_episodes(self, episode_uuids: List[str], progress_callback: Optional[Callable] = None):
+        """Graphiti processes episodes synchronously, so nothing to wait for."""
+        if progress_callback:
+            progress_callback("Episodes processed", 1.0)
+
+    def get_graph_data(self, graph_id: str) -> Dict[str, Any]:
+        """Get graph data for visualization."""
+        loop = asyncio.new_event_loop()
+        graphiti = self._get_graphiti()
+        try:
+            info = loop.run_until_complete(self._get_graph_info(graphiti, graph_id))
+            # Query nodes and edges for the visualization
+            nodes = []
+            edges = []
+            try:
+                from neo4j import GraphDatabase
+                driver = GraphDatabase.driver(
+                    Config.NEO4J_URI,
+                    auth=(Config.NEO4J_USER, Config.NEO4J_PASSWORD),
+                )
+                with driver.session() as session:
+                    result = session.run(
+                        "MATCH (n:Entity) RETURN elementId(n) AS id, n.name AS name, "
+                        "n.summary AS summary, labels(n) AS labels LIMIT 200"
+                    )
+                    for r in result:
+                        nodes.append({
+                            "id": r["id"],
+                            "name": r["name"],
+                            "summary": r["summary"],
+                            "type": next((l for l in r["labels"] if l != "Entity"), "Entity"),
+                        })
+                    result = session.run(
+                        "MATCH (a:Entity)-[r]->(b:Entity) "
+                        "RETURN elementId(a) AS source, elementId(b) AS target, "
+                        "type(r) AS type, r.fact AS fact LIMIT 500"
+                    )
+                    for r in result:
+                        edges.append({
+                            "source": r["source"],
+                            "target": r["target"],
+                            "type": r["type"],
+                            "fact": r["fact"],
+                        })
+                driver.close()
+            except Exception:
+                pass
+
+            return {
+                "nodes": nodes,
+                "edges": edges,
+                "node_count": info.node_count,
+                "edge_count": info.edge_count,
+                "entity_types": info.entity_types,
+            }
+        finally:
+            loop.close()
 
     def build_graph_async(
         self,

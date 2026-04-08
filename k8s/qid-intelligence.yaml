@@ -39,6 +39,10 @@ spec:
                   key: NEO4J_AUTH
             - name: GRAPHITI_GROUP_ID
               value: "qid_intelligence"
+            - name: OPENAI_API_KEY
+              value: "sk-proxy"
+            - name: OPENAI_BASE_URL
+              value: "http://azure-anthropic-proxy.cloudtorch.svc.cluster.local:4000/v1"
             - name: FLASK_DEBUG
               value: "False"
             - name: FLASK_PORT
