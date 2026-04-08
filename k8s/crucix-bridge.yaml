@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crucix-bridge
+  namespace: qid
+  labels:
+    app: crucix-bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: crucix-bridge
+  template:
+    metadata:
+      labels:
+        app: crucix-bridge
+    spec:
+      containers:
+        - name: crucix-bridge
+          image: ghcr.io/blevinson/qid-intelligence-bridge:latest
+          ports:
+            - containerPort: 8090
+              name: http
+          env:
+            - name: NEO4J_URI
+              value: "bolt://neo4j.qid.svc.cluster.local:7687"
+            - name: NEO4J_USER
+              value: "neo4j"
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: neo4j-credentials
+                  key: NEO4J_AUTH
+            - name: GRAPHITI_GROUP_ID
+              value: "qid_intelligence"
+            - name: POLL_INTERVAL_SECONDS
+              value: "300"
+            - name: QID_DB_HOST
+              value: "timescaledb.qid.svc.cluster.local"
+            - name: QID_DB_PORT
+              value: "5432"
+            - name: QID_DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: timescaledb-credentials
+                  key: POSTGRES_DB
+            - name: QID_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: timescaledb-credentials
+                  key: POSTGRES_USER
+            - name: QID_DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: timescaledb-credentials
+                  key: POSTGRES_PASSWORD
+            - name: OPENAI_API_KEY
+              value: "sk-proxy"
+            - name: OPENAI_BASE_URL
+              value: "http://azure-anthropic-proxy.cloudtorch.svc.cluster.local:4000/v1"
+            - name: HTTP_PORT
+              value: "8090"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            initialDelaySeconds: 10
+            periodSeconds: 60
+      imagePullSecrets:
+        - name: ghcr-pull
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crucix-bridge
+  namespace: qid
+  labels:
+    app: crucix-bridge
+spec:
+  selector:
+    app: crucix-bridge
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090
+  type: ClusterIP

@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    graphiti-core>=0.28.0 \
+    neo4j>=5.26.0 \
+    psycopg2-binary>=2.9.0
+
+COPY backend/crucix_bridge.py .
+
+EXPOSE 8090
+
+ENV PYTHONUNBUFFERED=1
+CMD ["python", "crucix_bridge.py"]
