@@ -1,0 +1,89 @@
+# Stage 1: Build Vue frontend
+FROM node:20-slim AS frontend-build
+WORKDIR /build
+COPY frontend/package.json frontend/package-lock.json ./frontend/
+RUN cd frontend && npm ci
+COPY frontend/ ./frontend/
+COPY locales/ ./locales/
+RUN cd frontend && npm run build
+
+# Stage 2: Python backend + nginx
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nginx supervisor \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python deps (two-stage for neo4j conflict)
+RUN pip install --no-cache-dir \
+    flask>=3.0.0 flask-cors>=6.0.0 openai>=1.0.0 \
+    graphiti-core>=0.28.0 neo4j>=5.26.0 psycopg2-binary>=2.9.0 \
+    PyMuPDF>=1.24.0 charset-normalizer>=3.0.0 chardet>=5.0.0 \
+    python-dotenv>=1.0.0 pydantic>=2.0.0 \
+ && pip install --no-cache-dir --no-deps camel-oasis==0.2.5 \
+ && pip install --no-cache-dir camel-ai==0.2.78
+
+COPY backend/ .
+COPY locales/ /locales/
+COPY --from=frontend-build /build/frontend/dist /var/www/html
+
+# nginx config: serve static + proxy /api to Flask
+RUN cat > /etc/nginx/sites-available/default <<'EOF'
+server {
+    listen 3000;
+    root /var/www/html;
+    index index.html;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:5001;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 120s;
+    }
+
+    location /health {
+        proxy_pass http://127.0.0.1:5001;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+EOF
+
+# supervisord config: run nginx + flask
+RUN cat > /etc/supervisor/conf.d/app.conf <<'EOF'
+[supervisord]
+nodaemon=true
+logfile=/dev/null
+logfile_maxbytes=0
+
+[program:flask]
+command=python /app/run.py
+directory=/app
+autostart=true
+autorestart=true
+stdout_logfile=/dev/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/fd/2
+stderr_logfile_maxbytes=0
+
+[program:nginx]
+command=nginx -g "daemon off;"
+autostart=true
+autorestart=true
+stdout_logfile=/dev/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/fd/2
+stderr_logfile_maxbytes=0
+EOF
+
+EXPOSE 3000
+
+ENV PYTHONUNBUFFERED=1
+ENV FLASK_PORT=5001
+ENV FLASK_DEBUG=False
+
+CMD ["supervisord", "-c", "/etc/supervisor/supervisord.conf"]
