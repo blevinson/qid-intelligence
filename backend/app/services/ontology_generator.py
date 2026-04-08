@@ -414,7 +414,7 @@ class OntologyGenerator:
             '"""',
             '',
             'from pydantic import Field',
-            'from zep_cloud.external_clients.ontology import EntityModel, EntityText, EdgeModel',
+            'from pydantic import BaseModel  # Graphiti uses Pydantic models for entity types',
             '',
             '',
             '# ============== 实体类型定义 ==============',
