@@ -58,7 +58,11 @@ spec:
             - name: SIM_ROUNDS
               value: "3"
             - name: SIM_POLL_INTERVAL
-              value: "600"
+              value: "3600"
+            - name: SIM_RTH_ONLY
+              value: "true"
+            - name: SIM_PRUNE_HOURS
+              value: "72"
           resources:
             requests:
               cpu: 200m

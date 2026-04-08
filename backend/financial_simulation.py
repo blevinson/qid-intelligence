@@ -23,6 +23,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from threading import Thread
+from zoneinfo import ZoneInfo
 
 import psycopg2
 from openai import OpenAI
@@ -61,7 +62,15 @@ TSDB_DSN = os.environ.get("QID_TSDB_DSN", (
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", None)
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.4-mini")
-POLL_INTERVAL = int(os.environ.get("SIM_POLL_INTERVAL", "600"))
+PRUNE_OLDER_THAN_HOURS = int(os.environ.get("SIM_PRUNE_HOURS", "72"))
+PRUNE_INTERVAL_CYCLES = int(os.environ.get("SIM_PRUNE_EVERY_N_CYCLES", "6"))  # prune every 6 cycles
+POLL_INTERVAL = int(os.environ.get("SIM_POLL_INTERVAL", "3600"))
+RTH_ONLY = os.environ.get("SIM_RTH_ONLY", "true").lower() in ("true", "1", "yes")
+RTH_START_HOUR = int(os.environ.get("SIM_RTH_START", "9"))   # ET
+RTH_START_MIN = int(os.environ.get("SIM_RTH_START_MIN", "0"))
+RTH_END_HOUR = int(os.environ.get("SIM_RTH_END", "17"))      # ET
+RTH_END_MIN = int(os.environ.get("SIM_RTH_END_MIN", "0"))
+EASTERN = ZoneInfo("America/New_York")
 
 # --- State ---
 graphiti = None
@@ -221,8 +230,21 @@ async def ingest_simulation_results(sweep: dict, posts: list):
     print(f"[FinSim] Ingested episode: {len(posts)} posts, regime={regime}")
 
 
+def _is_rth() -> bool:
+    """Check if current time is within Regular Trading Hours (ET)."""
+    now_et = datetime.now(EASTERN)
+    start = now_et.replace(hour=RTH_START_HOUR, minute=RTH_START_MIN, second=0, microsecond=0)
+    end = now_et.replace(hour=RTH_END_HOUR, minute=RTH_END_MIN, second=0, microsecond=0)
+    return start <= now_et <= end
+
+
 async def run_one_cycle():
     global last_sim_time
+
+    if RTH_ONLY and not _is_rth():
+        now_et = datetime.now(EASTERN)
+        print(f"[FinSim] Outside RTH ({now_et.strftime('%H:%M')} ET), skipping cycle")
+        return
 
     sweep = get_latest_sweep()
     if not sweep:
@@ -245,8 +267,44 @@ async def run_one_cycle():
     last_sim_time = sweep_time
 
 
+def _prune_old_episodes():
+    """Remove graph episodes and orphaned edges older than PRUNE_OLDER_THAN_HOURS."""
+    if not NEO4J_URI or PRUNE_OLDER_THAN_HOURS <= 0:
+        return
+    try:
+        from neo4j import GraphDatabase
+        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+        with driver.session() as session:
+            # Delete old episodic nodes
+            result = session.run(
+                "MATCH (e:Episodic) "
+                "WHERE e.created_at < datetime() - duration({hours: $hours}) "
+                "DETACH DELETE e "
+                "RETURN count(e) AS deleted",
+                hours=PRUNE_OLDER_THAN_HOURS,
+            )
+            deleted_episodes = result.single()["deleted"]
+
+            # Delete orphaned edges with no remaining episodes
+            result2 = session.run(
+                "MATCH (s)-[r:RELATES_TO]->(t) "
+                "WHERE r.created_at < datetime() - duration({hours: $hours}) "
+                "DELETE r "
+                "RETURN count(r) AS deleted",
+                hours=PRUNE_OLDER_THAN_HOURS,
+            )
+            deleted_edges = result2.single()["deleted"]
+
+        driver.close()
+        if deleted_episodes > 0 or deleted_edges > 0:
+            print(f"[FinSim] Pruned {deleted_episodes} episodes, {deleted_edges} edges older than {PRUNE_OLDER_THAN_HOURS}h")
+    except Exception as e:
+        print(f"[FinSim] Prune error: {e}")
+
+
 def poll_loop():
-    print(f"[FinSim] Poll loop started (interval={POLL_INTERVAL}s)")
+    print(f"[FinSim] Poll loop started (interval={POLL_INTERVAL}s, RTH_ONLY={RTH_ONLY})")
+    cycle_count = 0
     while running:
         loop = asyncio.new_event_loop()
         try:
@@ -258,6 +316,10 @@ def poll_loop():
             stats["errors"] += 1
         finally:
             loop.close()
+
+        cycle_count += 1
+        if cycle_count % PRUNE_INTERVAL_CYCLES == 0:
+            _prune_old_episodes()
 
         for _ in range(POLL_INTERVAL):
             if not running:
