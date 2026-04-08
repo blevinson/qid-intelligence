@@ -39,7 +39,14 @@ class Config:
     _raw_neo4j_pw = os.environ.get('NEO4J_PASSWORD', 'password')
     NEO4J_PASSWORD = _raw_neo4j_pw.split('/', 1)[1] if '/' in _raw_neo4j_pw else _raw_neo4j_pw
     GRAPHITI_GROUP_ID = os.environ.get('GRAPHITI_GROUP_ID', 'qid_intelligence')
-    
+
+    # TimescaleDB (for direct macro_sweeps queries)
+    TSDB_HOST = os.environ.get('TSDB_HOST', '')
+    TSDB_PORT = int(os.environ.get('TSDB_PORT', '5432'))
+    TSDB_DATABASE = os.environ.get('TSDB_DATABASE', 'qid_analytics')
+    TSDB_USER = os.environ.get('TSDB_USER', '')
+    TSDB_PASSWORD = os.environ.get('TSDB_PASSWORD', '')
+
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
     UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), '../uploads')

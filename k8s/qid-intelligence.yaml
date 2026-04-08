@@ -43,6 +43,25 @@ spec:
               value: "sk-proxy"
             - name: OPENAI_BASE_URL
               value: "http://azure-anthropic-proxy.cloudtorch.svc.cluster.local:4000/v1"
+            - name: TSDB_HOST
+              value: "qid-tsdb-rw.qid.svc.cluster.local"
+            - name: TSDB_PORT
+              value: "5432"
+            - name: TSDB_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: timescaledb-credentials
+                  key: POSTGRES_DB
+            - name: TSDB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: qid-mcp-tsdb-readonly
+                  key: TSDB_USER
+            - name: TSDB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: qid-mcp-tsdb-readonly
+                  key: TSDB_PASSWORD
             - name: FLASK_DEBUG
               value: "False"
             - name: FLASK_PORT
