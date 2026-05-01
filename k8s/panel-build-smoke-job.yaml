@@ -1,0 +1,38 @@
+# QIDP-229 — Panel-builder smoke. 5 symbols, all dts (cold mode).
+# Validates feature compute + parquet write end-to-end before the full
+# cold rebuild runs.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: panel-build-smoke
+  namespace: qid
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: smoke
+          image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-05-01f
+          command: ["python", "/scripts/panel_build.py"]
+          env:
+            - { name: PANEL_MODE, value: cold }
+            - { name: PANEL_VERSION, value: v1-smoke }
+            - { name: PANEL_SYMBOLS, value: "AAPL,MSFT,NVDA,SPY,XLE" }
+            - { name: MINIO_ENDPOINT, value: minio.qid.svc.cluster.local:9000 }
+            - name: MINIO_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_ACCESS_KEY } }
+            - name: MINIO_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_SECRET_KEY } }
+            - { name: MINIO_BUCKET, value: qid-equity }
+          volumeMounts:
+            - { name: script, mountPath: /scripts }
+          resources:
+            requests: { cpu: 50m, memory: 512Mi }
+            limits:   { cpu: 2000m, memory: 4Gi }
+      volumes:
+        - name: script
+          configMap: { name: panel-build-script, defaultMode: 0755 }

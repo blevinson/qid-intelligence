@@ -1,0 +1,80 @@
+# QIDP-229 — Daily panel build (incremental).
+# Runs after bars + universe export; produces qid-equity/panel/v1/dt=*/panel.parquet
+# for the last LOOKBACK days. Cold-start full rebuild ships as a separate Job.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: panel-build
+  namespace: qid
+spec:
+  schedule: "45 22 * * 1-5"   # 22:45 UTC weekdays (after universe-export at 22:30)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr-pull
+          containers:
+            - name: build
+              image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-05-01f
+              command: ["python", "/scripts/panel_build.py"]
+              env:
+                - { name: PANEL_MODE, value: daily }
+                - { name: PANEL_LOOKBACK_DAYS, value: "30" }
+                - { name: PANEL_VERSION, value: v1 }
+                - { name: MINIO_ENDPOINT, value: minio.qid.svc.cluster.local:9000 }
+                - name: MINIO_ACCESS_KEY
+                  valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_ACCESS_KEY } }
+                - name: MINIO_SECRET_KEY
+                  valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_SECRET_KEY } }
+                - { name: MINIO_BUCKET, value: qid-equity }
+              volumeMounts:
+                - { name: script, mountPath: /scripts }
+              resources:
+                requests: { cpu: 100m, memory: 1Gi }
+                limits:   { cpu: 2000m, memory: 4Gi }
+          volumes:
+            - name: script
+              configMap: { name: panel-build-script, defaultMode: 0755 }
+---
+# One-shot full panel rebuild (cold mode). Run manually after bar backfill.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: panel-build-cold
+  namespace: qid
+spec:
+  ttlSecondsAfterFinished: 172800
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: cold
+          image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-05-01f
+          command: ["python", "/scripts/panel_build.py"]
+          env:
+            - { name: PANEL_MODE, value: cold }
+            - { name: PANEL_VERSION, value: v1 }
+            - { name: MINIO_ENDPOINT, value: minio.qid.svc.cluster.local:9000 }
+            - name: MINIO_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_ACCESS_KEY } }
+            - name: MINIO_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_SECRET_KEY } }
+            - { name: MINIO_BUCKET, value: qid-equity }
+          volumeMounts:
+            - { name: script, mountPath: /scripts }
+          resources:
+            requests: { cpu: 200m, memory: 2Gi }
+            limits:   { cpu: 4000m, memory: 8Gi }
+      volumes:
+        - name: script
+          configMap: { name: panel-build-script, defaultMode: 0755 }

@@ -1,0 +1,49 @@
+# QIDP-229 — Daily breakout-universe snapshot to MinIO.
+# tradefarm reads this for equity_breakout_universe() — no direct TSDB
+# dependency from tradefarm.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: universe-export
+  namespace: qid
+spec:
+  schedule: "30 22 * * 1-5"   # 22:30 UTC weekdays (after bars cron at 22:12)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr-pull
+          containers:
+            - name: export
+              image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-05-01f
+              command: ["python", "/scripts/universe_export.py"]
+              env:
+                - { name: QID_DB_HOST, value: qid-tsdb-rw.qid.svc.cluster.local }
+                - { name: QID_DB_PORT, value: "5432" }
+                - name: QID_DB_NAME
+                  valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: dbname } }
+                - name: QID_DB_USER
+                  valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: username } }
+                - name: QID_DB_PASS
+                  valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: password } }
+                - { name: MINIO_ENDPOINT, value: minio.qid.svc.cluster.local:9000 }
+                - name: MINIO_ACCESS_KEY
+                  valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_ACCESS_KEY } }
+                - name: MINIO_SECRET_KEY
+                  valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_SECRET_KEY } }
+                - { name: MINIO_BUCKET, value: qid-equity }
+              volumeMounts:
+                - { name: script, mountPath: /scripts }
+              resources:
+                requests: { cpu: 25m, memory: 128Mi }
+                limits:   { cpu: 500m, memory: 512Mi }
+          volumes:
+            - name: script
+              configMap: { name: universe-export-script, defaultMode: 0755 }
