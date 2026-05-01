@@ -52,7 +52,7 @@ spec:
       containers:
         # ---- Node frontend / sweep orchestrator ----
         - name: crucix
-          image: ghcr.io/blevinson/crucix:latest
+          image: ghcr.io/blevinson/crucix:claude-code-2026-04-30
           imagePullPolicy: Always
           ports:
             - containerPort: 3117
@@ -96,11 +96,11 @@ spec:
               mountPath: /data
           resources:
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: 50m
+              memory: 128Mi
             limits:
-              cpu: 1000m
-              memory: 1Gi
+              cpu: 500m
+              memory: 512Mi
           readinessProbe:
             httpGet:
               path: /api/health
@@ -110,7 +110,7 @@ spec:
 
         # ---- Python Graphiti bridge (Haiku entity extraction + TEI embeds) ----
         - name: crucix-bridge
-          image: ghcr.io/blevinson/qid-intelligence-bridge:latest
+          image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-04-30
           imagePullPolicy: Always
           ports:
             - containerPort: 8090
