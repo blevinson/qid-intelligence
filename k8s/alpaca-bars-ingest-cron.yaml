@@ -1,0 +1,101 @@
+# QIDP-229 — Daily Alpaca bar refresh.
+# Daily lookback of 7 days handles weekend/holiday gaps + restatements.
+# Cold-start full backfill (5y) runs as a separate one-shot Job, not this cron.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: alpaca-bars-ingest
+  namespace: qid
+spec:
+  schedule: "12 22 * * 1-5"   # 22:12 UTC weekdays = ~6:12 PM ET (post-RTH close + buffer)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr-pull
+          containers:
+            - name: ingest
+              image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-05-01f
+              command: ["python", "/scripts/alpaca_bars_ingest.py"]
+              env:
+                - name: ALPACA_API_KEY
+                  valueFrom: { secretKeyRef: { name: alpaca-mcp-mcp-server-secrets, key: ALPACA_API_KEY } }
+                - name: ALPACA_SECRET_KEY
+                  valueFrom: { secretKeyRef: { name: alpaca-mcp-mcp-server-secrets, key: ALPACA_SECRET_KEY } }
+                - { name: BARS_LOOKBACK_DAYS, value: "7" }
+                - { name: QID_DB_HOST, value: qid-tsdb-rw.qid.svc.cluster.local }
+                - { name: QID_DB_PORT, value: "5432" }
+                - name: QID_DB_NAME
+                  valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: dbname } }
+                - name: QID_DB_USER
+                  valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: username } }
+                - name: QID_DB_PASS
+                  valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: password } }
+                - { name: MINIO_ENDPOINT, value: minio.qid.svc.cluster.local:9000 }
+                - name: MINIO_ACCESS_KEY
+                  valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_ACCESS_KEY } }
+                - name: MINIO_SECRET_KEY
+                  valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_SECRET_KEY } }
+                - { name: MINIO_BUCKET, value: qid-equity }
+              volumeMounts:
+                - { name: script, mountPath: /scripts }
+              resources:
+                requests: { cpu: 25m, memory: 128Mi }
+                limits:   { cpu: 1000m, memory: 1Gi }
+          volumes:
+            - name: script
+              configMap: { name: alpaca-bars-ingest-script, defaultMode: 0755 }
+---
+# One-shot 5y cold-start backfill template (run manually on first deploy).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alpaca-bars-backfill-5y
+  namespace: qid
+spec:
+  ttlSecondsAfterFinished: 172800
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: backfill
+          image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-05-01f
+          command: ["python", "/scripts/alpaca_bars_ingest.py"]
+          env:
+            - name: ALPACA_API_KEY
+              valueFrom: { secretKeyRef: { name: alpaca-mcp-mcp-server-secrets, key: ALPACA_API_KEY } }
+            - name: ALPACA_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: alpaca-mcp-mcp-server-secrets, key: ALPACA_SECRET_KEY } }
+            - { name: BARS_LOOKBACK_DAYS, value: "1825" }   # 5 years
+            - { name: QID_DB_HOST, value: qid-tsdb-rw.qid.svc.cluster.local }
+            - { name: QID_DB_PORT, value: "5432" }
+            - name: QID_DB_NAME
+              valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: dbname } }
+            - name: QID_DB_USER
+              valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: username } }
+            - name: QID_DB_PASS
+              valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: password } }
+            - { name: MINIO_ENDPOINT, value: minio.qid.svc.cluster.local:9000 }
+            - name: MINIO_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_ACCESS_KEY } }
+            - name: MINIO_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_SECRET_KEY } }
+            - { name: MINIO_BUCKET, value: qid-equity }
+          volumeMounts:
+            - { name: script, mountPath: /scripts }
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits:   { cpu: 2000m, memory: 4Gi }
+      volumes:
+        - name: script
+          configMap: { name: alpaca-bars-ingest-script, defaultMode: 0755 }

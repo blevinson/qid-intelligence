@@ -1,0 +1,41 @@
+# QIDP-229 — smoke test for the bar ingester. 10 hand-picked symbols, 1y lookback.
+# Confirms Alpaca auth, MinIO write, parquet shape, before firing the full backfill.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alpaca-bars-smoke
+  namespace: qid
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: smoke
+          image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-05-01f
+          command: ["python", "/scripts/alpaca_bars_ingest.py"]
+          env:
+            - name: ALPACA_API_KEY
+              valueFrom: { secretKeyRef: { name: alpaca-mcp-mcp-server-secrets, key: ALPACA_API_KEY } }
+            - name: ALPACA_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: alpaca-mcp-mcp-server-secrets, key: ALPACA_SECRET_KEY } }
+            - { name: BARS_LOOKBACK_DAYS, value: "365" }
+            - { name: BARS_SYMBOLS, value: "AAPL,MSFT,NVDA,TSLA,XLE,SPY,RTX,BA,XOM,GLD" }
+            - { name: BARS_BATCH_SIZE, value: "10" }
+            - { name: MINIO_ENDPOINT, value: minio.qid.svc.cluster.local:9000 }
+            - name: MINIO_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_ACCESS_KEY } }
+            - name: MINIO_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: minio-credentials, key: MINIO_SECRET_KEY } }
+            - { name: MINIO_BUCKET, value: qid-equity }
+          volumeMounts:
+            - { name: script, mountPath: /scripts }
+          resources:
+            requests: { cpu: 25m, memory: 128Mi }
+            limits:   { cpu: 1000m, memory: 1Gi }
+      volumes:
+        - name: script
+          configMap: { name: alpaca-bars-ingest-script, defaultMode: 0755 }

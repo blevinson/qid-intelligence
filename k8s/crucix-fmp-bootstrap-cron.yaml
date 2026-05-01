@@ -1,16 +1,21 @@
 # QIDP-226 — Refresh ticker_metadata from FMP profile-bulk.
 #
-# Initially: every 6 hours so we backfill parts 2-3 once the bulk endpoint's
-# "updated once every few hours" window resets. UPSERTs are idempotent —
-# safe to keep running. Once full universe is in place, switch schedule to
-# weekly (e.g. "0 7 * * 0") to keep market_cap fresh.
+# Cadence: monthly. Sector/industry/is_etf/country barely change. Only
+# market_cap drifts daily — but the breakout universe filter at $2B
+# tolerates 30-day lag for now (a name graduating from $1.9B to $2.1B
+# during a month gets picked up next refresh). When that drift becomes
+# costly, derive market_cap from Alpaca closes × cached shares_outstanding
+# instead of bumping FMP cadence.
+#
+# Set to monthly 2026-05-01 after FMP plan hit rolling-30-day cap (QIDP-230
+# context). 4 calls/month is sub-noise on any plan tier.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: crucix-fmp-bootstrap
   namespace: qid
 spec:
-  schedule: "23 */6 * * *"   # 23 past every 6 hours
+  schedule: "0 5 1 * *"   # 05:00 UTC on the 1st of every month
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 2
   failedJobsHistoryLimit: 3
