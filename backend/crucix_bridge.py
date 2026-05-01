@@ -218,6 +218,92 @@ def idea_to_narrative(idea: dict) -> str:
     return " ".join(parts)
 
 
+def _ticker_metadata_for(symbols: list[str]) -> dict[str, dict]:
+    """Look up ticker_metadata rows for a set of candidate symbols.
+    Returns {symbol: {sector, industry, name, is_etf}} for rows that exist
+    AND have a non-null sector. Symbols are upper-cased for matching.
+    """
+    if not symbols:
+        return {}
+    upper = [s.upper() for s in symbols]
+    try:
+        with psycopg2.connect(TSDB_DSN) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT symbol, sector, industry, name, is_etf
+                    FROM ticker_metadata
+                    WHERE symbol = ANY(%s) AND sector IS NOT NULL
+                    """,
+                    (upper,),
+                )
+                return {
+                    row[0]: {"sector": row[1], "industry": row[2], "name": row[3], "is_etf": row[4]}
+                    for row in cur.fetchall()
+                }
+    except Exception as e:
+        print(f"[Bridge] ticker_metadata lookup failed: {e}")
+        return {}
+
+
+async def _link_sector_for_idea(group_id: str, episode_name: str, ticker: str) -> int:
+    """After Haiku entity-extraction lands, MERGE Sector + IN_SECTOR edges
+    for the *idea's own ticker* (not whatever Haiku picked).
+
+    Why: Haiku frequently extracts company names ("Raytheon") rather than
+    symbols ("RTX"), so a symbol-match against extracted entities misses
+    most of them. We know the symbol explicitly from the idea payload.
+
+    Strategy:
+      1. Look up sector/industry in ticker_metadata (skip if missing).
+      2. MERGE a `:Ticker` node keyed on symbol.
+      3. MERGE Sector node + IN_SECTOR edge.
+      4. Connect the episode to the Ticker via MENTIONS so downstream
+         queries pick it up alongside Haiku's extractions.
+
+    Returns count of IN_SECTOR edges merged (0 or 1 in practice).
+    """
+    if not ticker or ticker == "UNK":
+        return 0
+    sym = ticker.upper()
+    meta = _ticker_metadata_for([sym]).get(sym)
+    if not meta:
+        return 0
+
+    g = _get_graphiti()
+    driver = g.driver
+
+    cypher = """
+        // Episode already exists from add_episode — just resolve it
+        MATCH (e:Episodic {group_id: $g, name: $name})
+
+        // Idempotent Ticker node keyed on symbol
+        MERGE (t:Ticker {symbol: $sym})
+            ON CREATE SET t.created_at = datetime(), t.source = 'crucix'
+        SET t.sector = $sector, t.industry = $industry, t.is_etf = $is_etf
+
+        // Sector node + IN_SECTOR edge
+        MERGE (s:Sector {name: $sector})
+            ON CREATE SET s.created_at = datetime()
+        MERGE (t)-[r:IN_SECTOR]->(s)
+            ON CREATE SET r.created_at = datetime(), r.source = 'fmp'
+
+        // Tie the episode to the ticker so qid-crucix entity / sector
+        // queries see ideas attached to the tickers they're about
+        MERGE (e)-[m:MENTIONS]->(t)
+            ON CREATE SET m.created_at = datetime(), m.source = 'crucix-layer-c'
+
+        RETURN count(r) AS n
+    """
+    async with driver.session() as sess:
+        r = await sess.run(
+            cypher, g=group_id, name=episode_name,
+            sym=sym, sector=meta["sector"], industry=meta["industry"], is_etf=bool(meta["is_etf"]),
+        )
+        row = await r.single()
+        return row["n"] if row else 0
+
+
 async def ingest_idea(idea: dict):
     g = _get_graphiti()
     narrative = idea_to_narrative(idea)
@@ -245,6 +331,15 @@ async def ingest_idea(idea: dict):
     stats["ideas_ingested"] = stats.get("ideas_ingested", 0) + 1
     stats["last_idea"] = datetime.now(timezone.utc).isoformat()
     print(f"[Bridge] Ingested idea {name}")
+
+    # Layer C — wire IN_SECTOR edge for the idea's own ticker. Failure is
+    # non-fatal; the episode is already in the graph.
+    try:
+        n_edges = await _link_sector_for_idea(GROUP_ID, name, ticker)
+        if n_edges:
+            print(f"[Bridge] Linked IN_SECTOR for {ticker} on {name}")
+    except Exception as e:
+        print(f"[Bridge] sector-link error for {name}: {e}")
 
 
 async def ingest_sweep(sweep: dict):
