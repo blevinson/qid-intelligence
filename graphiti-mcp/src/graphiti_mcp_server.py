@@ -627,22 +627,35 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
 async def get_episodes(
     group_ids: list[str] | None = None,
     max_episodes: int = 10,
+    group_id: str | None = None,
+    last_n: int | None = None,
 ) -> EpisodeSearchResponse | ErrorResponse:
-    """Get episodes from the graph memory.
+    """Get episodes from the graph memory, ordered by created_at descending.
 
     Args:
         group_ids: Optional list of group IDs to filter results
         max_episodes: Maximum number of episodes to return (default: 10)
+        group_id: (alias) singular form — accepted for caller convenience
+        last_n: (alias) accepted for caller convenience — same as max_episodes
+
+    Patched 2026-05-01 (QIDP-228): aliases prevent silent fallback to default
+    group when callers use singular naming, and ordering is created_at DESC
+    rather than UUID DESC so 'last N' actually means most-recent N.
     """
     global graphiti_service
 
     if graphiti_service is None:
         return ErrorResponse(error='Graphiti service not initialized')
 
+    # Coalesce aliases. Plural takes precedence if both supplied.
+    if group_ids is None and group_id is not None:
+        group_ids = [group_id]
+    if last_n is not None:
+        max_episodes = last_n
+
     try:
         client = await graphiti_service.get_client()
 
-        # Use the provided group_ids or fall back to the default from config if none provided
         effective_group_ids = (
             group_ids
             if group_ids is not None
@@ -651,37 +664,56 @@ async def get_episodes(
             else []
         )
 
-        # Get episodes from the driver directly
-        from graphiti_core.nodes import EpisodicNode
+        if not effective_group_ids:
+            return EpisodeSearchResponse(message='No group_id specified', episodes=[])
 
-        if effective_group_ids:
-            episodes = await EpisodicNode.get_by_group_ids(
-                client.driver, effective_group_ids, limit=max_episodes
-            )
-        else:
-            # If no group IDs, we need to use a different approach
-            # For now, return empty list when no group IDs specified
-            episodes = []
+        # Custom Cypher — ORDER BY created_at DESC explicitly. graphiti-core's
+        # EpisodicNode.get_by_group_ids orders by uuid DESC, which means
+        # "last_n" returns an arbitrary slice of UUID space.
+        records, _, _ = await client.driver.execute_query(
+            """
+            MATCH (e:Episodic)
+            WHERE e.group_id IN $group_ids
+            RETURN
+              e.uuid AS uuid,
+              e.name AS name,
+              e.content AS content,
+              e.created_at AS created_at,
+              e.source AS source,
+              e.source_description AS source_description,
+              e.group_id AS group_id,
+              e.valid_at AS valid_at
+            ORDER BY e.created_at DESC
+            LIMIT $limit
+            """,
+            group_ids=effective_group_ids,
+            limit=int(max_episodes),
+            routing_='r',
+        )
 
-        if not episodes:
-            return EpisodeSearchResponse(message='No episodes found', episodes=[])
+        from graphiti_core.nodes import EpisodeType
 
-        # Format the results
+        def _src(s):
+            try:
+                return EpisodeType(s).value if s else 'text'
+            except Exception:
+                return str(s) if s else 'text'
+
         episode_results = []
-        for episode in episodes:
-            episode_dict = {
-                'uuid': episode.uuid,
-                'name': episode.name,
-                'content': episode.content,
-                'created_at': episode.created_at.isoformat() if episode.created_at else None,
-                'source': episode.source.value
-                if hasattr(episode.source, 'value')
-                else str(episode.source),
-                'source_description': episode.source_description,
-                'group_id': episode.group_id,
-            }
-            episode_results.append(episode_dict)
+        for r in records:
+            ca = r['created_at']
+            episode_results.append({
+                'uuid': r['uuid'],
+                'name': r['name'],
+                'content': r['content'],
+                'created_at': ca.isoformat() if hasattr(ca, 'isoformat') else (str(ca) if ca else None),
+                'source': _src(r['source']),
+                'source_description': r['source_description'],
+                'group_id': r['group_id'],
+            })
 
+        if not episode_results:
+            return EpisodeSearchResponse(message='No episodes found', episodes=[])
         return EpisodeSearchResponse(
             message='Episodes retrieved successfully', episodes=episode_results
         )
