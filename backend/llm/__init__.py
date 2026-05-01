@@ -8,6 +8,12 @@ Provides:
 """
 
 from .claude_code_llm_client import ClaudeCodeLLMClient
+from .noop_cross_encoder import NoopCrossEncoder
 from .tei_embedder import TEIEmbedder, TEIEmbedderConfig
 
-__all__ = ["ClaudeCodeLLMClient", "TEIEmbedder", "TEIEmbedderConfig"]
+__all__ = [
+    "ClaudeCodeLLMClient",
+    "NoopCrossEncoder",
+    "TEIEmbedder",
+    "TEIEmbedderConfig",
+]

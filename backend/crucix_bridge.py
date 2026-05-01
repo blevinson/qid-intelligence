@@ -25,7 +25,7 @@ from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.llm_client.config import LLMConfig
 
-from llm import ClaudeCodeLLMClient, TEIEmbedder
+from llm import ClaudeCodeLLMClient, NoopCrossEncoder, TEIEmbedder
 
 # --- Config from env ---
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://neo4j.qid.svc.cluster.local:7687")
@@ -58,9 +58,45 @@ ORDER BY time ASC
 
 # --- State ---
 graphiti = None
-last_sweep_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
+# Poll watermark: by default skip the entire historical macro_sweeps table
+# (we're event-driven via /ideas + /ingest now). Override with
+# BRIDGE_POLL_FROM=YYYY-MM-DDTHH:MM:SS+00:00 to backfill from a specific
+# point. Set BRIDGE_DISABLE_POLL=true to turn the poll loop off entirely.
+_poll_from = os.environ.get("BRIDGE_POLL_FROM")
+if _poll_from:
+    last_sweep_time = datetime.fromisoformat(_poll_from)
+else:
+    last_sweep_time = datetime.now(timezone.utc)
+DISABLE_POLL = os.environ.get("BRIDGE_DISABLE_POLL", "").lower() in ("1", "true", "yes")
 stats = {"sweeps_ingested": 0, "errors": 0, "last_ingest": None, "started_at": None}
 running = True
+
+# Single dedicated event loop for all Graphiti work — neo4j's async driver
+# binds to the loop that first awaits it, so we keep one loop alive in a
+# worker thread and submit coroutines via run_coroutine_threadsafe.
+_worker_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _start_worker_loop() -> asyncio.AbstractEventLoop:
+    global _worker_loop
+    if _worker_loop is not None:
+        return _worker_loop
+    loop = asyncio.new_event_loop()
+
+    def _run():
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    Thread(target=_run, daemon=True, name="GraphitiLoop").start()
+    _worker_loop = loop
+    return loop
+
+
+def _submit(coro):
+    """Schedule coro on the worker loop. Returns a concurrent.futures.Future."""
+    loop = _start_worker_loop()
+    import asyncio as _asyncio  # local alias for clarity
+    return _asyncio.run_coroutine_threadsafe(coro, loop)
 
 
 def sweep_to_narrative(sweep: dict) -> str:
@@ -130,6 +166,7 @@ def _get_graphiti() -> Graphiti:
             NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
             llm_client=ClaudeCodeLLMClient(config=llm_config),
             embedder=TEIEmbedder(),
+            cross_encoder=NoopCrossEncoder(),
         )
     return graphiti
 
@@ -257,14 +294,12 @@ def poll_loop():
         sweeps = poll_tsdb()
         if sweeps:
             print(f"[Bridge] Found {len(sweeps)} new sweeps")
-            loop = asyncio.new_event_loop()
             for sweep in sweeps:
                 try:
-                    loop.run_until_complete(ingest_sweep(sweep))
+                    _submit(ingest_sweep(sweep)).result(timeout=600)
                 except Exception as e:
                     print(f"[Bridge] Ingest error: {e}")
                     stats["errors"] += 1
-            loop.close()
 
         for _ in range(POLL_INTERVAL):
             if not running:
@@ -296,9 +331,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             payload = json.loads(body)
-            loop = asyncio.new_event_loop()
-            loop.run_until_complete(handler(payload))
-            loop.close()
+            _submit(handler(payload)).result(timeout=600)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -315,29 +348,37 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if self.path == "/ingest":
             self._ingest_endpoint(ingest_sweep)
         elif self.path == "/ideas":
-            # Accept either a single idea dict or {"ideas": [...]}
+            # Async path: parse body, ack 202 immediately, ingest in background.
+            # Each idea triggers a Haiku entity-extraction pass which can take
+            # 30-60s, so we never want the HTTP caller blocking that long.
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             try:
                 payload = json.loads(body)
-                ideas = payload.get("ideas") if isinstance(payload, dict) and "ideas" in payload else (
-                    payload if isinstance(payload, list) else [payload]
-                )
-                loop = asyncio.new_event_loop()
-                for idea in ideas:
-                    loop.run_until_complete(ingest_idea(idea))
-                loop.close()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": True, "count": len(ideas)}).encode())
             except Exception as e:
-                print(f"[Bridge] /ideas error: {e}")
-                stats["errors"] += 1
-                self.send_response(500)
+                self.send_response(400)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                self.wfile.write(json.dumps({"error": f"bad json: {e}"}).encode())
+                return
+
+            ideas = payload.get("ideas") if isinstance(payload, dict) and "ideas" in payload else (
+                payload if isinstance(payload, list) else [payload]
+            )
+
+            def _worker(items):
+                for idea in items:
+                    try:
+                        _submit(ingest_idea(idea)).result(timeout=600)
+                    except Exception as e:
+                        print(f"[Bridge] /ideas worker error on {idea.get('ticker','?')}: {e}")
+                        stats["errors"] += 1
+
+            Thread(target=_worker, args=(ideas,), daemon=True, name="IdeasWorker").start()
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"accepted": True, "count": len(ideas)}).encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -362,9 +403,17 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    # Start poll thread
-    poll_thread = Thread(target=poll_loop, daemon=True, name="CrucixPoll")
-    poll_thread.start()
+    # Spin up the dedicated Graphiti event loop thread before any worker
+    # tries to submit work to it.
+    _start_worker_loop()
+
+    # Start poll thread (skipped when BRIDGE_DISABLE_POLL=true — event-
+    # driven /ideas + /ingest path is the default now)
+    if DISABLE_POLL:
+        print("[Bridge] Poll loop disabled (BRIDGE_DISABLE_POLL=true)")
+    else:
+        poll_thread = Thread(target=poll_loop, daemon=True, name="CrucixPoll")
+        poll_thread.start()
 
     # Start HTTP server (webhook + health)
     server = HTTPServer(("0.0.0.0", HTTP_PORT), BridgeHandler)
