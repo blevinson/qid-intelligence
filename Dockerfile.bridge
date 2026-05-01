@@ -2,12 +2,27 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# nodejs is required by claude_agent_sdk — it shells out to the `claude`
+# CLI shipped as an npm package. Same pattern as tradefarm-deps.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force
+
 RUN pip install --no-cache-dir \
-    graphiti-core>=0.28.0 \
-    neo4j>=5.26.0 \
-    psycopg2-binary>=2.9.0
+    "graphiti-core>=0.28.0" \
+    "neo4j>=5.26.0" \
+    "psycopg2-binary>=2.9.0" \
+    "claude-agent-sdk>=0.0.10" \
+    "anthropic>=0.40.0" \
+    "httpx>=0.27.0" \
+    "pydantic>=2.0.0"
 
 COPY backend/crucix_bridge.py .
+COPY backend/llm ./llm
 
 EXPOSE 8090
 

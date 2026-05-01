@@ -1,0 +1,219 @@
+# Combined crucix + crucix-bridge Deployment.
+#
+# Single Pod with two containers sharing a longhorn RWO PVC at /data so
+# both can read $HOME/.claude/.credentials.json (HOME=/data/.claude-home).
+# Mirrors the tradefarm/paperclip pattern — one PVC, one OAuth login,
+# subscription-billed Haiku for entity extraction + Sonnet for ideas.
+#
+# Bootstrap (one-time):
+#   kubectl -n qid exec -it deploy/crucix -c crucix-bridge -- claude
+# Then `/login` and complete OAuth in the browser; `.credentials.json`
+# lands on the PVC and both containers see it.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: crucix-claude-home
+  namespace: qid
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crucix
+  namespace: qid
+  labels:
+    app: crucix
+spec:
+  replicas: 1
+  strategy:
+    # Recreate so we don't briefly run two pods racing on the RWO PVC.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: crucix
+  template:
+    metadata:
+      labels:
+        app: crucix
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull
+      volumes:
+        - name: claude-home
+          persistentVolumeClaim:
+            claimName: crucix-claude-home
+      containers:
+        # ---- Node frontend / sweep orchestrator ----
+        - name: crucix
+          image: ghcr.io/blevinson/crucix:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3117
+              name: http
+          env:
+            - name: PORT
+              value: "3117"
+            - name: REFRESH_INTERVAL_MINUTES
+              value: "15"
+            - name: HOME
+              value: /data/.claude-home
+            - name: LLM_PROVIDER
+              value: claude_code
+            - name: CLAUDE_CODE_MODEL
+              value: sonnet
+            - name: CLAUDE_CODE_CONCURRENCY
+              value: "2"
+            - name: CRUCIX_BRIDGE_URL
+              value: http://localhost:8090
+            - name: QID_DB_HOST
+              value: qid-tsdb-rw.qid.svc.cluster.local
+            - name: QID_DB_PORT
+              value: "5432"
+            - name: QID_DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: qid-tsdb-app
+                  key: dbname
+            - name: QID_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: qid-tsdb-app
+                  key: username
+            - name: QID_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: qid-tsdb-app
+                  key: password
+          volumeMounts:
+            - name: claude-home
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3117
+            initialDelaySeconds: 10
+            periodSeconds: 30
+
+        # ---- Python Graphiti bridge (Haiku entity extraction + TEI embeds) ----
+        - name: crucix-bridge
+          image: ghcr.io/blevinson/qid-intelligence-bridge:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8090
+              name: bridge
+          env:
+            - name: HOME
+              value: /data/.claude-home
+            - name: LLM_MODEL
+              value: claude-haiku-4-5
+            - name: CLAUDE_CODE_CONCURRENCY
+              value: "4"
+            - name: NEO4J_URI
+              value: bolt://neo4j.qid.svc.cluster.local:7687
+            - name: NEO4J_USER
+              value: neo4j
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: neo4j-credentials
+                  key: NEO4J_AUTH
+            - name: GRAPHITI_GROUP_ID
+              value: qid_intelligence
+            - name: POLL_INTERVAL_SECONDS
+              value: "300"
+            - name: HTTP_PORT
+              value: "8090"
+            - name: EMBEDDING_API_URL
+              value: http://tei-embed.cloudtorch.svc.cluster.local:8080/v1/embeddings
+            - name: EMBEDDING_MODEL
+              value: BAAI/bge-m3
+            - name: EMBEDDING_DIMENSIONS
+              value: "1024"
+            - name: QID_DB_HOST
+              value: qid-tsdb-rw.qid.svc.cluster.local
+            - name: QID_DB_PORT
+              value: "5432"
+            - name: QID_DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: qid-tsdb-app
+                  key: dbname
+            - name: QID_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: qid-tsdb-app
+                  key: username
+            - name: QID_DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: qid-tsdb-app
+                  key: password
+          volumeMounts:
+            - name: claude-home
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            initialDelaySeconds: 30
+            periodSeconds: 60
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crucix
+  namespace: qid
+  labels:
+    app: crucix
+spec:
+  selector:
+    app: crucix
+  ports:
+    - name: http
+      port: 3117
+      targetPort: 3117
+  type: ClusterIP
+---
+# Bridge service kept for any external callers; in-pod calls go through localhost.
+apiVersion: v1
+kind: Service
+metadata:
+  name: crucix-bridge
+  namespace: qid
+  labels:
+    app: crucix-bridge
+spec:
+  selector:
+    app: crucix
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090
+  type: ClusterIP
