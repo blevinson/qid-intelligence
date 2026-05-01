@@ -1,0 +1,86 @@
+# QIDP-230 — Alpaca screener movers snapshot → crucix_movers.
+# Replaces fmp-movers-ingest. Same cadence, same destination table.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: alpaca-movers-ingest
+  namespace: qid
+spec:
+  schedule: "30 13-21 * * 1-5"   # 13:30-21:30 UTC = 9:30 AM-5:30 PM ET, weekdays
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 86400
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: ghcr-pull
+          containers:
+            - name: ingest
+              image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-05-01f
+              command: ["python", "/scripts/alpaca_movers_ingest.py"]
+              env:
+                - name: ALPACA_API_KEY
+                  valueFrom: { secretKeyRef: { name: alpaca-mcp-mcp-server-secrets, key: ALPACA_API_KEY } }
+                - name: ALPACA_SECRET_KEY
+                  valueFrom: { secretKeyRef: { name: alpaca-mcp-mcp-server-secrets, key: ALPACA_SECRET_KEY } }
+                - { name: QID_DB_HOST, value: qid-tsdb-rw.qid.svc.cluster.local }
+                - { name: QID_DB_PORT, value: "5432" }
+                - name: QID_DB_NAME
+                  valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: dbname } }
+                - name: QID_DB_USER
+                  valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: username } }
+                - name: QID_DB_PASS
+                  valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: password } }
+              volumeMounts:
+                - { name: script, mountPath: /scripts }
+              resources:
+                requests: { cpu: 25m, memory: 128Mi }
+                limits:   { cpu: 500m, memory: 512Mi }
+          volumes:
+            - name: script
+              configMap: { name: alpaca-movers-ingest-script, defaultMode: 0755 }
+---
+# One-shot Job for manual smoke testing.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alpaca-movers-ingest-smoke
+  namespace: qid
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: ingest
+          image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-05-01f
+          command: ["python", "/scripts/alpaca_movers_ingest.py"]
+          env:
+            - name: ALPACA_API_KEY
+              valueFrom: { secretKeyRef: { name: alpaca-mcp-mcp-server-secrets, key: ALPACA_API_KEY } }
+            - name: ALPACA_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: alpaca-mcp-mcp-server-secrets, key: ALPACA_SECRET_KEY } }
+            - { name: QID_DB_HOST, value: qid-tsdb-rw.qid.svc.cluster.local }
+            - { name: QID_DB_PORT, value: "5432" }
+            - name: QID_DB_NAME
+              valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: dbname } }
+            - name: QID_DB_USER
+              valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: username } }
+            - name: QID_DB_PASS
+              valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: password } }
+          volumeMounts:
+            - { name: script, mountPath: /scripts }
+          resources:
+            requests: { cpu: 25m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+      volumes:
+        - name: script
+          configMap: { name: alpaca-movers-ingest-script, defaultMode: 0755 }
