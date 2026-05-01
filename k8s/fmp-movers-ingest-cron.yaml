@@ -1,18 +1,14 @@
-# QIDP-226 — Refresh ticker_metadata from FMP profile-bulk.
-#
-# Initially: every 6 hours so we backfill parts 2-3 once the bulk endpoint's
-# "updated once every few hours" window resets. UPSERTs are idempotent —
-# safe to keep running. Once full universe is in place, switch schedule to
-# weekly (e.g. "0 7 * * 0") to keep market_cap fresh.
+# FMP movers snapshot → crucix_movers. Hourly during US trading hours.
+# 30 mins past the hour: lets a full bar settle before snapshot.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: crucix-fmp-bootstrap
+  name: fmp-movers-ingest
   namespace: qid
 spec:
-  schedule: "23 */6 * * *"   # 23 past every 6 hours
+  schedule: "30 13-21 * * 1-5"   # 13:30-21:30 UTC = 9:30 AM-5:30 PM ET, weekdays
   concurrencyPolicy: Forbid
-  successfulJobsHistoryLimit: 2
+  successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
@@ -24,11 +20,10 @@ spec:
           imagePullSecrets:
             - name: ghcr-pull
           containers:
-            - name: bootstrap
+            - name: ingest
               image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-04-30e
-              command: ["python", "/scripts/fmp_bootstrap.py"]
+              command: ["python", "/scripts/fmp_movers_ingest.py"]
               env:
-                - { name: FMP_PARTS, value: "0,1,2,3" }
                 - name: FMP_API_KEY
                   valueFrom: { secretKeyRef: { name: crucix-fmp, key: FMP_API_KEY } }
                 - { name: QID_DB_HOST, value: qid-tsdb-rw.qid.svc.cluster.local }
@@ -46,4 +41,4 @@ spec:
                 limits:   { cpu: 500m, memory: 512Mi }
           volumes:
             - name: script
-              configMap: { name: fmp-bootstrap-script, defaultMode: 0755 }
+              configMap: { name: fmp-movers-ingest-script, defaultMode: 0755 }

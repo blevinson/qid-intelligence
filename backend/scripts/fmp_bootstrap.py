@@ -11,7 +11,7 @@ for the full universe — no per-ticker lazy lookups.
 Env:
     FMP_API_KEY      — required
     QID_TSDB_DSN     — postgres connection string (or QID_DB_* parts)
-    FMP_PARTS        — optional, default '1,2,3' (3 chunks of ~22K rows each)
+    FMP_PARTS        — optional, default '0,1,2,3' (4 chunks of ~22K rows each)
     FMP_INCLUDE_NON_US — '1' to include non-US tickers (default: US-only)
 """
 
@@ -34,7 +34,7 @@ log = logging.getLogger("fmp_bootstrap")
 
 FMP_BASE = "https://financialmodelingprep.com/stable"
 API_KEY = os.environ.get("FMP_API_KEY", "").strip()
-PARTS = [int(p) for p in os.environ.get("FMP_PARTS", "1,2,3").split(",") if p.strip()]
+PARTS = [int(p) for p in os.environ.get("FMP_PARTS", "0,1,2,3").split(",") if p.strip()]
 INCLUDE_NON_US = os.environ.get("FMP_INCLUDE_NON_US", "").lower() in ("1", "true", "yes")
 
 DSN = os.environ.get("QID_TSDB_DSN") or (

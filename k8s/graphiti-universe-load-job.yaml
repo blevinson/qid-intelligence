@@ -1,0 +1,41 @@
+# One-shot bulk load: alpaca_x_industry → neo4j as Ticker/Industry/Sector
+# structural edges. Idempotent (pure MERGEs).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: graphiti-universe-load
+  namespace: qid
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: load
+          image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-04-30e
+          command: ["python", "/scripts/graphiti_universe_load.py"]
+          env:
+            - { name: NEO4J_URI, value: bolt://neo4j.qid.svc.cluster.local:7687 }
+            - { name: NEO4J_USER, value: neo4j }
+            - name: NEO4J_PASSWORD
+              valueFrom: { secretKeyRef: { name: neo4j-credentials, key: NEO4J_AUTH } }
+            - { name: GRAPHITI_GROUP_ID, value: qid_intelligence }
+            - { name: QID_DB_HOST, value: qid-tsdb-rw.qid.svc.cluster.local }
+            - { name: QID_DB_PORT, value: "5432" }
+            - name: QID_DB_NAME
+              valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: dbname } }
+            - name: QID_DB_USER
+              valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: username } }
+            - name: QID_DB_PASS
+              valueFrom: { secretKeyRef: { name: qid-tsdb-app, key: password } }
+          volumeMounts:
+            - { name: script, mountPath: /scripts }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 1000m, memory: 1Gi }
+      volumes:
+        - name: script
+          configMap: { name: graphiti-universe-load-script, defaultMode: 0755 }

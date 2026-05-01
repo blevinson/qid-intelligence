@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -721,6 +722,216 @@ async def get_episodes(
         error_msg = str(e)
         logger.error(f'Error getting episodes: {error_msg}')
         return ErrorResponse(error=f'Error getting episodes: {error_msg}')
+
+
+def _parse_since(spec: str | None) -> datetime | None:
+    """Parse 1h, 30m, 7d, 2w, or ISO timestamp into a UTC datetime."""
+    if not spec:
+        return None
+    s = spec.strip().lower()
+    if s and s[-1] in 'smhdw' and s[:-1].isdigit():
+        n = int(s[:-1])
+        unit = s[-1]
+        delta = {
+            's': timedelta(seconds=n),
+            'm': timedelta(minutes=n),
+            'h': timedelta(hours=n),
+            'd': timedelta(days=n),
+            'w': timedelta(weeks=n),
+        }[unit]
+        return datetime.now(timezone.utc) - delta
+    try:
+        return datetime.fromisoformat(spec.replace('Z', '+00:00'))
+    except ValueError as e:
+        raise ValueError(f'unrecognized since spec {spec!r}') from e
+
+
+@mcp.tool()
+async def crucix_industry(
+    name: str,
+    limit: int = 20,
+    since: str | None = None,
+) -> dict[str, Any] | ErrorResponse:
+    """Tickers in an industry, ranked by recent crucix-idea mentions then market cap.
+
+    Walks the Graphiti structural backbone:
+        (:Ticker)-[:IN_INDUSTRY]->(:Industry)-[:IN_SECTOR]->(:Sector)
+    populated from the Alpaca-tradable × FMP universe (~9.5K tickers,
+    151 industries). Mention count is per crucix_idea_* episode.
+
+    Args:
+        name: Industry name, case-insensitive substring (e.g. 'Oil & Gas Drilling',
+              'Semiconductors', 'Banks - Regional', 'Gold').
+        limit: max tickers (default 20).
+        since: optional time window for mention counting — '1h', '24h', '7d', '2w'
+               or ISO timestamp.
+    """
+    global graphiti_service
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    gid = config.graphiti.group_id or 'qid_intelligence'
+    since_dt = _parse_since(since)
+
+    try:
+        client = await graphiti_service.get_client()
+        records, _, _ = await client.driver.execute_query(
+            """
+            MATCH (i:Industry)
+            WHERE toLower(i.name) CONTAINS toLower($q)
+            OPTIONAL MATCH (i)-[:IN_SECTOR]->(s:Sector)
+            RETURN i.name AS name, collect(DISTINCT s.name) AS sectors
+            ORDER BY size(i.name) ASC LIMIT 1
+            """,
+            q=name,
+            routing_='r',
+        )
+        if not records:
+            return {'query': name, 'industry': None, 'tickers': []}
+        primary = records[0]['name']
+        sectors = [s for s in (records[0]['sectors'] or []) if s]
+
+        params: dict[str, Any] = {'industry': primary, 'g': gid, 'limit': int(limit)}
+        time_clause = ''
+        if since_dt is not None:
+            time_clause = 'AND e.created_at >= $since_dt'
+            params['since_dt'] = since_dt
+
+        records, _, _ = await client.driver.execute_query(
+            f"""
+            MATCH (i:Industry {{name: $industry}})<-[:IN_INDUSTRY]-(t:Ticker)
+            OPTIONAL MATCH (t)<-[:MENTIONS]-(e:Episodic)
+            WHERE e IS NULL OR (e.group_id = $g
+                AND e.name STARTS WITH 'crucix_idea_'
+                {time_clause})
+            WITH t, count(DISTINCT e) AS mentions, max(e.created_at) AS last_seen
+            RETURN
+              t.symbol     AS symbol,
+              t.name       AS name,
+              t.market_cap AS market_cap,
+              t.is_etf     AS is_etf,
+              t.exchange   AS exchange,
+              mentions,
+              last_seen
+            ORDER BY mentions DESC, market_cap IS NULL ASC, market_cap DESC, symbol ASC
+            LIMIT $limit
+            """,
+            **params,
+            routing_='r',
+        )
+        tickers = [
+            {
+                'symbol': r['symbol'],
+                'name': r['name'],
+                'market_cap': r['market_cap'],
+                'is_etf': r['is_etf'],
+                'exchange': r['exchange'],
+                'mentions': r['mentions'],
+                'last_seen': str(r['last_seen']) if r['last_seen'] else None,
+            }
+            for r in records
+        ]
+        return {
+            'query': name,
+            'industry': primary,
+            'sectors': sectors,
+            'filters': {'limit': limit, 'since': since},
+            'tickers': tickers,
+        }
+    except Exception as e:
+        logger.error(f'Error in crucix_industry: {e}')
+        return ErrorResponse(error=f'Error in crucix_industry: {e}')
+
+
+@mcp.tool()
+async def crucix_sector(
+    name: str,
+    limit: int = 20,
+    since: str | None = None,
+) -> dict[str, Any] | ErrorResponse:
+    """Tickers in a sector, ranked by recent crucix-idea mentions.
+
+    Walks (:Ticker)-[:IN_SECTOR]->(:Sector) — coarser than crucix_industry
+    (11 sectors vs 151 industries). Useful for sweeping rotation themes.
+
+    Args:
+        name: Sector name, case-insensitive substring (e.g. 'Energy', 'Tech').
+        limit: max tickers (default 20).
+        since: optional time window for mention counting.
+    """
+    global graphiti_service
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    gid = config.graphiti.group_id or 'qid_intelligence'
+    since_dt = _parse_since(since)
+
+    try:
+        client = await graphiti_service.get_client()
+        records, _, _ = await client.driver.execute_query(
+            """
+            MATCH (s:Sector)
+            WHERE toLower(s.name) CONTAINS toLower($q)
+            RETURN s.name AS name
+            ORDER BY size(s.name) ASC LIMIT 1
+            """,
+            q=name,
+            routing_='r',
+        )
+        if not records:
+            return {'query': name, 'sector': None, 'tickers': []}
+        primary = records[0]['name']
+
+        params: dict[str, Any] = {'sector': primary, 'g': gid, 'limit': int(limit)}
+        time_clause = ''
+        if since_dt is not None:
+            time_clause = 'AND e.created_at >= $since_dt'
+            params['since_dt'] = since_dt
+
+        records, _, _ = await client.driver.execute_query(
+            f"""
+            MATCH (s:Sector {{name: $sector}})<-[:IN_SECTOR]-(t:Ticker)
+            OPTIONAL MATCH (t)<-[:MENTIONS]-(e:Episodic)
+            WHERE e IS NULL OR (e.group_id = $g
+                AND e.name STARTS WITH 'crucix_idea_'
+                {time_clause})
+            WITH t, count(DISTINCT e) AS mentions, max(e.created_at) AS last_seen
+            OPTIONAL MATCH (t)-[:IN_INDUSTRY]->(i:Industry)
+            RETURN
+              t.symbol     AS symbol,
+              t.name       AS name,
+              t.market_cap AS market_cap,
+              i.name       AS industry,
+              t.is_etf     AS is_etf,
+              mentions,
+              last_seen
+            ORDER BY mentions DESC, market_cap IS NULL ASC, market_cap DESC, symbol ASC
+            LIMIT $limit
+            """,
+            **params,
+            routing_='r',
+        )
+        tickers = [
+            {
+                'symbol': r['symbol'],
+                'name': r['name'],
+                'market_cap': r['market_cap'],
+                'industry': r['industry'],
+                'is_etf': r['is_etf'],
+                'mentions': r['mentions'],
+                'last_seen': str(r['last_seen']) if r['last_seen'] else None,
+            }
+            for r in records
+        ]
+        return {
+            'query': name,
+            'sector': primary,
+            'filters': {'limit': limit, 'since': since},
+            'tickers': tickers,
+        }
+    except Exception as e:
+        logger.error(f'Error in crucix_sector: {e}')
+        return ErrorResponse(error=f'Error in crucix_sector: {e}')
 
 
 @mcp.tool()
