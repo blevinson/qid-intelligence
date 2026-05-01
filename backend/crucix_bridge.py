@@ -23,9 +23,9 @@ from threading import Thread
 import psycopg2
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType
-from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig
-from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+
+from llm import ClaudeCodeLLMClient, TEIEmbedder
 
 # --- Config from env ---
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://neo4j.qid.svc.cluster.local:7687")
@@ -43,9 +43,7 @@ TSDB_DSN = os.environ.get("QID_TSDB_DSN", (
     f"user={os.environ.get('QID_DB_USER', 'qid')} "
     f"password={os.environ.get('QID_DB_PASS', 'qid')}"
 ))
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", None)
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.4-mini")
+LLM_MODEL = os.environ.get("LLM_MODEL", "claude-haiku-4-5")
 
 SWEEP_QUERY = """
 SELECT time, regime, regime_reasons, suppress, bias_direction, threshold,
@@ -124,27 +122,97 @@ def sweep_to_narrative(sweep: dict) -> str:
     return " ".join(parts)
 
 
-async def ingest_sweep(sweep: dict):
-    global graphiti, last_sweep_time
+def _get_graphiti() -> Graphiti:
+    global graphiti
     if graphiti is None:
-        llm_config = LLMConfig(
-            api_key=OPENAI_API_KEY or None,
-            model=LLM_MODEL,
-            small_model=LLM_MODEL,
-            base_url=OPENAI_BASE_URL,
-        )
-        llm_client = OpenAIClient(config=llm_config)
-        embedder_config = OpenAIEmbedderConfig(
-            api_key=OPENAI_API_KEY or None,
-            base_url=OPENAI_BASE_URL,
-        )
-        embedder = OpenAIEmbedder(config=embedder_config)
+        llm_config = LLMConfig(model=LLM_MODEL, small_model=LLM_MODEL)
         graphiti = Graphiti(
             NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
-            llm_client=llm_client,
-            embedder=embedder,
+            llm_client=ClaudeCodeLLMClient(config=llm_config),
+            embedder=TEIEmbedder(),
         )
+    return graphiti
 
+
+def idea_to_narrative(idea: dict) -> str:
+    """Render a crucix trade idea as a Graphiti episode narrative."""
+    parts: list[str] = []
+    ticker = idea.get("ticker") or idea.get("symbol") or "UNKNOWN"
+    side = idea.get("side") or idea.get("direction") or "long"
+    sector = idea.get("sector")
+    confidence = idea.get("confidence")
+    thesis = idea.get("thesis") or idea.get("rationale") or ""
+
+    head = f"Crucix trade idea: {side.upper()} {ticker}"
+    if sector:
+        head += f" ({sector})"
+    if confidence is not None:
+        head += f", confidence {confidence}"
+    parts.append(head + ".")
+
+    if thesis:
+        parts.append(f"Thesis: {thesis}")
+
+    catalysts = idea.get("catalysts") or []
+    if catalysts:
+        parts.append("Catalysts: " + "; ".join(str(c) for c in catalysts) + ".")
+
+    risks = idea.get("risks") or []
+    if risks:
+        parts.append("Risks: " + "; ".join(str(r) for r in risks) + ".")
+
+    entry = idea.get("entry")
+    target = idea.get("target")
+    stop = idea.get("stop")
+    levels = []
+    if entry is not None:
+        levels.append(f"entry {entry}")
+    if target is not None:
+        levels.append(f"target {target}")
+    if stop is not None:
+        levels.append(f"stop {stop}")
+    if levels:
+        parts.append("Levels: " + ", ".join(levels) + ".")
+
+    sources = idea.get("sources") or []
+    if sources:
+        parts.append(f"Sources: {len(sources)} cited.")
+
+    return " ".join(parts)
+
+
+async def ingest_idea(idea: dict):
+    g = _get_graphiti()
+    narrative = idea_to_narrative(idea)
+
+    ts = idea.get("time") or idea.get("timestamp")
+    if isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            ts = datetime.now(timezone.utc)
+    if not isinstance(ts, datetime):
+        ts = datetime.now(timezone.utc)
+
+    ticker = idea.get("ticker") or idea.get("symbol") or "UNK"
+    name = f"crucix_idea_{ticker}_{ts.strftime('%Y%m%d_%H%M%S')}"
+
+    await g.add_episode(
+        name=name,
+        episode_body=narrative,
+        source=EpisodeType.text,
+        source_description="Crucix trade idea",
+        reference_time=ts,
+        group_id=GROUP_ID,
+    )
+    stats["ideas_ingested"] = stats.get("ideas_ingested", 0) + 1
+    stats["last_idea"] = datetime.now(timezone.utc).isoformat()
+    print(f"[Bridge] Ingested idea {name}")
+
+
+async def ingest_sweep(sweep: dict):
+    global last_sweep_time
+    g = _get_graphiti()
     narrative = sweep_to_narrative(sweep)
     sweep_time = sweep.get("time", datetime.now(timezone.utc))
     if not hasattr(sweep_time, "tzinfo"):
@@ -152,7 +220,7 @@ async def ingest_sweep(sweep: dict):
 
     ts_str = sweep_time.strftime("%Y%m%d_%H%M%S") if hasattr(sweep_time, "strftime") else str(int(time.time()))
 
-    await graphiti.add_episode(
+    await g.add_episode(
         name=f"crucix_sweep_{ts_str}",
         episode_body=narrative,
         source=EpisodeType.text,
@@ -223,21 +291,48 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def _ingest_endpoint(self, handler):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body)
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(handler(payload))
+            loop.close()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True}).encode())
+        except Exception as e:
+            print(f"[Bridge] {self.path} ingest error: {e}")
+            stats["errors"] += 1
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+
     def do_POST(self):
         if self.path == "/ingest":
+            self._ingest_endpoint(ingest_sweep)
+        elif self.path == "/ideas":
+            # Accept either a single idea dict or {"ideas": [...]}
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             try:
-                sweep = json.loads(body)
+                payload = json.loads(body)
+                ideas = payload.get("ideas") if isinstance(payload, dict) and "ideas" in payload else (
+                    payload if isinstance(payload, list) else [payload]
+                )
                 loop = asyncio.new_event_loop()
-                loop.run_until_complete(ingest_sweep(sweep))
+                for idea in ideas:
+                    loop.run_until_complete(ingest_idea(idea))
                 loop.close()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"ok": True}).encode())
+                self.wfile.write(json.dumps({"ok": True, "count": len(ideas)}).encode())
             except Exception as e:
-                print(f"[Bridge] Webhook ingest error: {e}")
+                print(f"[Bridge] /ideas error: {e}")
                 stats["errors"] += 1
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
