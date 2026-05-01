@@ -15,7 +15,10 @@ dependencies = [
     
     # LLM 相关
     "openai>=1.0.0",
-    
+    "claude-agent-sdk>=0.0.10",  # Claude Code subscription (no API key, no Azure)
+    "anthropic>=0.40.0",          # types/utilities reused by claude-agent-sdk
+    "httpx>=0.27.0",               # TEI embeddings client
+
     # Knowledge Graph (Graphiti + Neo4j)
     "graphiti-core>=0.28.0",
     "neo4j>=5.23.0",

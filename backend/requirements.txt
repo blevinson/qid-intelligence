@@ -12,6 +12,11 @@ flask-cors>=6.0.0
 # ============= LLM 相关 =============
 # OpenAI SDK（统一使用 OpenAI 格式调用 LLM）
 openai>=1.0.0
+# Claude Code subscription auth (replaces Azure OpenAI proxy for entity extraction)
+claude-agent-sdk>=0.0.10
+anthropic>=0.40.0
+# TEI embeddings client
+httpx>=0.27.0
 
 # ============= Knowledge Graph (Graphiti + Neo4j) =============
 graphiti-core>=0.28.0
