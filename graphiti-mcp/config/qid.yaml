@@ -1,0 +1,38 @@
+# Graphiti MCP config for the qid namespace deploy.
+# Subscription LLM (Haiku) + in-cluster TEI embedder + qid neo4j.
+server:
+  transport: "http"
+  host: "0.0.0.0"
+  port: 8000
+
+llm:
+  provider: "claude_code"
+  model: "claude-haiku-4-5"
+  max_tokens: 4096
+  temperature: 0.0
+  # Required by schema even though claude_code doesn't read these.
+  providers:
+    openai:
+      api_key: "unused"
+
+embedder:
+  provider: "tei"
+  model: "BAAI/bge-m3"
+  dimensions: 1024
+  providers:
+    openai:
+      api_key: "unused"
+
+database:
+  provider: "neo4j"
+  providers:
+    neo4j:
+      uri: "${NEO4J_URI:bolt://neo4j.qid.svc.cluster.local:7687}"
+      username: "${NEO4J_USER:neo4j}"
+      password: "${NEO4J_PASSWORD}"
+
+# Default group_id for ungrouped writes; consumers can pass explicit
+# group_ids on per-call basis to read across groups (qid_intelligence,
+# tradefarm_global, etc.)
+graphiti:
+  group_id: "${GRAPHITI_GROUP_ID:qid_intelligence}"

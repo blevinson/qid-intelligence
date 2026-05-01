@@ -1,0 +1,65 @@
+# Vendored Graphiti MCP server, patched to use:
+#   * ClaudeCodeLLMClient (subscription, no API key)
+#   * TEIEmbedder (in-cluster BGE-M3, 1024-dim)
+#   * NoopCrossEncoder (skips OpenAIRerankerClient default)
+#
+# Source: graphiti-mcp/ (vendored from getzep/graphiti tag matching
+# graphiti-core 0.28.x). Patches in:
+#   - graphiti-mcp/src/services/factories.py (claude_code, tei cases)
+#   - graphiti-mcp/src/graphiti_mcp_server.py (NoopCrossEncoder injection)
+#
+# Adapter modules live in backend/llm/ — copied in alongside the MCP code
+# and importable via `from llm import ...`.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Node.js for the `claude` CLI that ClaudeCodeLLMClient shells out to.
+# Same pattern as Dockerfile.bridge.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force
+
+RUN pip install --no-cache-dir \
+    "graphiti-core>=0.28.0" \
+    "neo4j>=5.26.0" \
+    "claude-agent-sdk>=0.0.10" \
+    "anthropic>=0.40.0" \
+    "httpx>=0.27.0" \
+    "pydantic>=2.0.0" \
+    "mcp>=1.0.0" \
+    "pyyaml>=6.0" \
+    "openai>=1.0.0"
+
+# Adapter package — must come before MCP source so `from llm import ...`
+# resolves at module load.
+COPY backend/llm ./llm
+
+# Vendored MCP server (patched).
+COPY graphiti-mcp/main.py ./main.py
+COPY graphiti-mcp/src ./src
+COPY graphiti-mcp/config ./config
+
+EXPOSE 8000
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app:/app/src
+
+# Entrypoint strips the "neo4j/" prefix from NEO4J_AUTH-style secret values
+# before launching, so we can mount the same neo4j-credentials secret crucix
+# uses without an external transform.
+COPY <<'EOF' /entrypoint.sh
+#!/bin/sh
+set -e
+case "$NEO4J_PASSWORD" in
+  neo4j/*) export NEO4J_PASSWORD="${NEO4J_PASSWORD#neo4j/}" ;;
+esac
+exec python main.py --config /app/config/qid.yaml
+EOF
+RUN chmod +x /entrypoint.sh
+
+CMD ["/entrypoint.sh"]

@@ -1,0 +1,112 @@
+# QIDP-227 — patched upstream Graphiti MCP, qid namespace.
+# Single deployment serves both crucix's intelligence graph and TradeFarm's
+# agent memory (TFARM-24) across distinct group_ids.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graphiti-mcp
+  namespace: qid
+  labels:
+    app: graphiti-mcp
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate            # RWO PVC for OAuth — single pod
+  selector:
+    matchLabels:
+      app: graphiti-mcp
+  template:
+    metadata:
+      labels:
+        app: graphiti-mcp
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull
+      volumes:
+        - name: claude-home
+          persistentVolumeClaim:
+            claimName: graphiti-mcp-claude-home
+      containers:
+        - name: graphiti-mcp
+          image: ghcr.io/blevinson/graphiti-mcp:claude-code-2026-05-01
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: HOME
+              value: /data/.claude-home
+            - name: NEO4J_URI
+              value: bolt://neo4j.qid.svc.cluster.local:7687
+            - name: NEO4J_USER
+              value: neo4j
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: neo4j-credentials
+                  key: NEO4J_AUTH
+            - name: GRAPHITI_GROUP_ID
+              value: qid_intelligence
+            - name: EMBEDDING_API_URL
+              value: http://tei-embed.cloudtorch.svc.cluster.local:8080/v1/embeddings
+            - name: EMBEDDING_MODEL
+              value: BAAI/bge-m3
+            - name: EMBEDDING_DIMENSIONS
+              value: "1024"
+            - name: CLAUDE_CODE_CONCURRENCY
+              value: "4"
+          volumeMounts:
+            - name: claude-home
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 180
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 6
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: graphiti-mcp-claude-home
+  namespace: qid
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: graphiti-mcp
+  namespace: qid
+  labels:
+    app: graphiti-mcp
+spec:
+  selector:
+    app: graphiti-mcp
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
