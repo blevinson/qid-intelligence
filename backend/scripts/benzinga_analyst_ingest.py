@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS crucix_analyst_actions (
   importance      INT,
   notes           TEXT,
   fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (benzinga_id)
+  PRIMARY KEY (action_date, benzinga_id)
 );
 
 SELECT create_hypertable('crucix_analyst_actions', 'action_date', if_not_exists => TRUE);
@@ -149,7 +149,7 @@ def upsert_actions(conn, actions, panel_symbols):
                 rating_current, rating_prior, pt_current, pt_prior, pt_delta_pct,
                 importance, notes, fetched_at)
                VALUES %s
-               ON CONFLICT (benzinga_id) DO UPDATE SET
+               ON CONFLICT (action_date, benzinga_id) DO UPDATE SET
                  action_company = EXCLUDED.action_company,
                  action_pt      = EXCLUDED.action_pt,
                  rating_current = EXCLUDED.rating_current,
