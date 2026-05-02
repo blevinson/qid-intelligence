@@ -49,13 +49,13 @@ def fetch_tickers():
     resp = requests.get(SEC_TICKERS_URL, headers={"User-Agent": USER_AGENT}, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-    rows = []
+    seen = {}
     for entry in data.values():
         cik = int(entry["cik_str"])
         ticker = entry["ticker"].upper()
         company = entry.get("title", "")
-        rows.append((cik, ticker, company, "NOW()"))
-    return rows
+        seen[cik] = (cik, ticker, company)
+    return list(seen.values())
 
 
 def main():
