@@ -210,6 +210,12 @@ def upsert_filings(conn, filings, cik_map):
     for f in filings:
         f["ticker"] = cik_map.get(f["cik"])
 
+    # Deduplicate by (accession_no, filed_at) — EDGAR can return the same filing multiple times
+    seen = {}
+    for f in filings:
+        seen[(f["accession_no"], f["filed_at"])] = f
+    filings = list(seen.values())
+
     with conn.cursor() as cur:
         values = [
             (
