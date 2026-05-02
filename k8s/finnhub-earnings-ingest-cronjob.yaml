@@ -1,0 +1,67 @@
+# FIN-1070: Finnhub earnings-calendar ingest (daily 06:00 UTC)
+# Single API call + ~1500-row UPSERT — lightweight job
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: finnhub-earnings-ingest
+  namespace: qid
+  labels:
+    app: finnhub-earnings-ingest
+    component: crucix
+spec:
+  schedule: "0 6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels:
+            app: finnhub-earnings-ingest
+            component: crucix
+        spec:
+          imagePullSecrets:
+            - name: ghcr-pull
+          restartPolicy: OnFailure
+          containers:
+            - name: ingest
+              image: ghcr.io/blevinson/qid-intelligence-bridge:latest
+              command:
+                - python
+                - /app/scripts/finnhub_earnings_ingest.py
+              imagePullPolicy: Always
+              env:
+                - name: QID_DB_HOST
+                  value: "qid-tsdb-rw.qid.svc.cluster.local"
+                - name: QID_DB_PORT
+                  value: "5432"
+                - name: QID_DB_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: dbname
+                - name: QID_DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: username
+                - name: QID_DB_PASS
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: password
+                - name: FINNHUB_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: crucix-api-keys
+                      key: FINNHUB_API_KEY
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 128Mi

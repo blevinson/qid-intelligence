@@ -1,0 +1,63 @@
+# FIN-1072: SEC EDGAR 8-K filings ingest (every 15 min)
+# 8-Ks are time-sensitive — M&A announcements, earnings, guidance
+# Depends on sec_cik_ticker table being populated (daily CronJob)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sec-8k-ingest
+  namespace: qid
+  labels:
+    app: sec-8k-ingest
+    component: crucix
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 600  # 10 min max
+      template:
+        metadata:
+          labels:
+            app: sec-8k-ingest
+            component: crucix
+        spec:
+          imagePullSecrets:
+            - name: ghcr-pull
+          restartPolicy: OnFailure
+          containers:
+            - name: ingest
+              image: ghcr.io/blevinson/qid-intelligence-bridge:latest
+              command:
+                - python
+                - /app/scripts/sec_8k_ingest.py
+              imagePullPolicy: Always
+              env:
+                - name: QID_DB_HOST
+                  value: "qid-tsdb-rw.qid.svc.cluster.local"
+                - name: QID_DB_PORT
+                  value: "5432"
+                - name: QID_DB_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: dbname
+                - name: QID_DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: username
+                - name: QID_DB_PASS
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: password
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
