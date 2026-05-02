@@ -58,7 +58,7 @@ ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS crucix_sec_8k_filings (
-  accession_no TEXT PRIMARY KEY,
+  accession_no TEXT NOT NULL,
   cik          BIGINT NOT NULL,
   ticker       TEXT,
   filed_at     TIMESTAMPTZ NOT NULL,
@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS crucix_sec_8k_filings (
   has_material BOOLEAN NOT NULL,
   filing_url   TEXT NOT NULL,
   document_url TEXT,
-  fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (accession_no, filed_at)
 );
 
 SELECT create_hypertable('crucix_sec_8k_filings', 'filed_at', if_not_exists => TRUE);
@@ -228,7 +229,7 @@ def upsert_filings(conn, filings, cik_map):
             """INSERT INTO crucix_sec_8k_filings
                (accession_no, cik, ticker, filed_at, items, has_material, filing_url, document_url, fetched_at)
                VALUES %s
-               ON CONFLICT (accession_no) DO UPDATE SET
+               ON CONFLICT (accession_no, filed_at) DO UPDATE SET
                  ticker       = EXCLUDED.ticker,
                  items        = EXCLUDED.items,
                  has_material = EXCLUDED.has_material,
