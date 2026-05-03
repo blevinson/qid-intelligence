@@ -1,0 +1,90 @@
+# QIDP-241: Crucix idea outcome attribution — hourly write-back of forward returns.
+# Runs at :45 each hour (after panel-build data is guaranteed fresh).
+# Idempotent: deduplicates via crucix_idea_outcomes TSDB table.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: crucix-idea-outcome
+  namespace: qid
+  labels:
+    app: crucix-idea-outcome
+    component: crucix-attribution
+spec:
+  schedule: "45 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            app: crucix-idea-outcome
+            component: crucix-attribution
+        spec:
+          imagePullSecrets:
+            - name: ghcr-pull
+          restartPolicy: OnFailure
+          containers:
+            - name: crucix-idea-outcome
+              image: ghcr.io/blevinson/qid-intelligence-bridge:latest
+              imagePullPolicy: Always
+              command:
+                - python
+                - /app/scripts/crucix_idea_outcome.py
+              env:
+                - name: MINIO_ENDPOINT
+                  value: "minio.qid.svc.cluster.local:9000"
+                - name: MINIO_SECURE
+                  value: "false"
+                - name: QID_EQUITY_BUCKET
+                  value: "qid-equity"
+                - name: MINIO_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: minio-credentials
+                      key: access-key
+                - name: MINIO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: minio-credentials
+                      key: secret-key
+                - name: QID_DB_HOST
+                  value: "qid-tsdb-rw.qid.svc.cluster.local"
+                - name: QID_DB_PORT
+                  value: "5432"
+                - name: QID_DB_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: dbname
+                - name: QID_DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: username
+                - name: QID_DB_PASS
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: password
+                - name: NEO4J_URI
+                  value: "bolt://neo4j.qid.svc.cluster.local:7687"
+                - name: NEO4J_USER
+                  value: "neo4j"
+                - name: NEO4J_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: neo4j-auth
+                      key: NEO4J_AUTH
+                - name: GRAPHITI_GROUP_ID
+                  value: "qid_intelligence"
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 512Mi
+                limits:
+                  cpu: 500m
+                  memory: 1Gi
