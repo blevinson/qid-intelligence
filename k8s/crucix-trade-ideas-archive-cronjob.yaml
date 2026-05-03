@@ -1,0 +1,86 @@
+# FIN-1155: Sync crucix trade ideas from graphiti to crucix_trade_ideas TSDB table.
+# Runs every 15 minutes; idempotent via (idea_name, time) unique constraint.
+# Bridge image has graphiti-core + psycopg2; script is injected via ConfigMap.
+# Can be disabled once the bridge image is rebuilt with native TSDB archival.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: crucix-trade-ideas-archive
+  namespace: qid
+  labels:
+    app: crucix-trade-ideas-archive
+    component: crucix-archival
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: crucix-trade-ideas-archive
+            component: crucix-archival
+        spec:
+          imagePullSecrets:
+            - name: ghcr-pull
+          restartPolicy: Never
+          volumes:
+            - name: script
+              configMap:
+                name: crucix-trade-ideas-archive-script
+          containers:
+            - name: archive
+              image: ghcr.io/blevinson/qid-intelligence-bridge:claude-code-2026-05-01b
+              imagePullPolicy: IfNotPresent
+              command:
+                - python
+                - /scripts/crucix_trade_ideas_archive.py
+                - "--max-episodes"
+                - "5000"
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+              env:
+                - name: NEO4J_URI
+                  value: "bolt://neo4j.qid.svc.cluster.local:7687"
+                - name: NEO4J_USER
+                  value: "neo4j"
+                - name: NEO4J_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: neo4j-credentials
+                      key: NEO4J_AUTH
+                - name: GRAPHITI_GROUP_ID
+                  value: "qid_intelligence"
+                - name: LLM_MODEL
+                  value: "claude-haiku-4-5"
+                - name: QID_DB_HOST
+                  value: "qid-tsdb-rw.qid.svc.cluster.local"
+                - name: QID_DB_PORT
+                  value: "5432"
+                - name: QID_DB_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: dbname
+                - name: QID_DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: username
+                - name: QID_DB_PASS
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: password
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi

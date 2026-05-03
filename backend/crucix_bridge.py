@@ -23,9 +23,9 @@ from threading import Thread
 import psycopg2
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType
-from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig
-from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+
+from llm import ClaudeCodeLLMClient, NoopCrossEncoder, TEIEmbedder
 
 # --- Config from env ---
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://neo4j.qid.svc.cluster.local:7687")
@@ -43,9 +43,7 @@ TSDB_DSN = os.environ.get("QID_TSDB_DSN", (
     f"user={os.environ.get('QID_DB_USER', 'qid')} "
     f"password={os.environ.get('QID_DB_PASS', 'qid')}"
 ))
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", None)
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.4-mini")
+LLM_MODEL = os.environ.get("LLM_MODEL", "claude-haiku-4-5")
 
 SWEEP_QUERY = """
 SELECT time, regime, regime_reasons, suppress, bias_direction, threshold,
@@ -60,9 +58,45 @@ ORDER BY time ASC
 
 # --- State ---
 graphiti = None
-last_sweep_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
+# Poll watermark: by default skip the entire historical macro_sweeps table
+# (we're event-driven via /ideas + /ingest now). Override with
+# BRIDGE_POLL_FROM=YYYY-MM-DDTHH:MM:SS+00:00 to backfill from a specific
+# point. Set BRIDGE_DISABLE_POLL=true to turn the poll loop off entirely.
+_poll_from = os.environ.get("BRIDGE_POLL_FROM")
+if _poll_from:
+    last_sweep_time = datetime.fromisoformat(_poll_from)
+else:
+    last_sweep_time = datetime.now(timezone.utc)
+DISABLE_POLL = os.environ.get("BRIDGE_DISABLE_POLL", "").lower() in ("1", "true", "yes")
 stats = {"sweeps_ingested": 0, "errors": 0, "last_ingest": None, "started_at": None}
 running = True
+
+# Single dedicated event loop for all Graphiti work — neo4j's async driver
+# binds to the loop that first awaits it, so we keep one loop alive in a
+# worker thread and submit coroutines via run_coroutine_threadsafe.
+_worker_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _start_worker_loop() -> asyncio.AbstractEventLoop:
+    global _worker_loop
+    if _worker_loop is not None:
+        return _worker_loop
+    loop = asyncio.new_event_loop()
+
+    def _run():
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    Thread(target=_run, daemon=True, name="GraphitiLoop").start()
+    _worker_loop = loop
+    return loop
+
+
+def _submit(coro):
+    """Schedule coro on the worker loop. Returns a concurrent.futures.Future."""
+    loop = _start_worker_loop()
+    import asyncio as _asyncio  # local alias for clarity
+    return _asyncio.run_coroutine_threadsafe(coro, loop)
 
 
 def sweep_to_narrative(sweep: dict) -> str:
@@ -124,27 +158,282 @@ def sweep_to_narrative(sweep: dict) -> str:
     return " ".join(parts)
 
 
-async def ingest_sweep(sweep: dict):
-    global graphiti, last_sweep_time
+def _get_graphiti() -> Graphiti:
+    global graphiti
     if graphiti is None:
-        llm_config = LLMConfig(
-            api_key=OPENAI_API_KEY or None,
-            model=LLM_MODEL,
-            small_model=LLM_MODEL,
-            base_url=OPENAI_BASE_URL,
-        )
-        llm_client = OpenAIClient(config=llm_config)
-        embedder_config = OpenAIEmbedderConfig(
-            api_key=OPENAI_API_KEY or None,
-            base_url=OPENAI_BASE_URL,
-        )
-        embedder = OpenAIEmbedder(config=embedder_config)
+        llm_config = LLMConfig(model=LLM_MODEL, small_model=LLM_MODEL)
         graphiti = Graphiti(
             NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
-            llm_client=llm_client,
-            embedder=embedder,
+            llm_client=ClaudeCodeLLMClient(config=llm_config),
+            embedder=TEIEmbedder(),
+            cross_encoder=NoopCrossEncoder(),
         )
+    return graphiti
 
+
+def idea_to_narrative(idea: dict) -> str:
+    """Render a crucix trade idea as a Graphiti episode narrative."""
+    parts: list[str] = []
+    ticker = idea.get("ticker") or idea.get("symbol") or "UNKNOWN"
+    side = idea.get("side") or idea.get("direction") or "long"
+    sector = idea.get("sector")
+    confidence = idea.get("confidence")
+    thesis = idea.get("thesis") or idea.get("rationale") or ""
+
+    head = f"Crucix trade idea: {side.upper()} {ticker}"
+    if sector:
+        head += f" ({sector})"
+    if confidence is not None:
+        head += f", confidence {confidence}"
+    parts.append(head + ".")
+
+    if thesis:
+        parts.append(f"Thesis: {thesis}")
+
+    catalysts = idea.get("catalysts") or []
+    if catalysts:
+        parts.append("Catalysts: " + "; ".join(str(c) for c in catalysts) + ".")
+
+    risks = idea.get("risks") or []
+    if risks:
+        parts.append("Risks: " + "; ".join(str(r) for r in risks) + ".")
+
+    entry = idea.get("entry")
+    target = idea.get("target")
+    stop = idea.get("stop")
+    levels = []
+    if entry is not None:
+        levels.append(f"entry {entry}")
+    if target is not None:
+        levels.append(f"target {target}")
+    if stop is not None:
+        levels.append(f"stop {stop}")
+    if levels:
+        parts.append("Levels: " + ", ".join(levels) + ".")
+
+    sources = idea.get("sources") or []
+    if sources:
+        parts.append(f"Sources: {len(sources)} cited.")
+
+    return " ".join(parts)
+
+
+def _ticker_metadata_for(symbols: list[str]) -> dict[str, dict]:
+    """Look up ticker_metadata rows for a set of candidate symbols.
+    Returns {symbol: {sector, industry, name, is_etf}} for rows that exist
+    AND have a non-null sector. Symbols are upper-cased for matching.
+    """
+    if not symbols:
+        return {}
+    upper = [s.upper() for s in symbols]
+    try:
+        with psycopg2.connect(TSDB_DSN) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT symbol, sector, industry, name, is_etf
+                    FROM ticker_metadata
+                    WHERE symbol = ANY(%s) AND sector IS NOT NULL
+                    """,
+                    (upper,),
+                )
+                return {
+                    row[0]: {"sector": row[1], "industry": row[2], "name": row[3], "is_etf": row[4]}
+                    for row in cur.fetchall()
+                }
+    except Exception as e:
+        print(f"[Bridge] ticker_metadata lookup failed: {e}")
+        return {}
+
+
+async def _link_sector_for_idea(group_id: str, episode_name: str, ticker: str) -> int:
+    """After Haiku entity-extraction lands, MERGE Sector + IN_SECTOR edges
+    for the *idea's own ticker* (not whatever Haiku picked).
+
+    Why: Haiku frequently extracts company names ("Raytheon") rather than
+    symbols ("RTX"), so a symbol-match against extracted entities misses
+    most of them. We know the symbol explicitly from the idea payload.
+
+    Strategy:
+      1. Look up sector/industry in ticker_metadata (skip if missing).
+      2. MERGE a `:Ticker` node keyed on symbol.
+      3. MERGE Sector node + IN_SECTOR edge.
+      4. Connect the episode to the Ticker via MENTIONS so downstream
+         queries pick it up alongside Haiku's extractions.
+
+    Returns count of IN_SECTOR edges merged (0 or 1 in practice).
+    """
+    if not ticker or ticker == "UNK":
+        return 0
+    sym = ticker.upper()
+    meta = _ticker_metadata_for([sym]).get(sym)
+    if not meta:
+        return 0
+
+    g = _get_graphiti()
+    driver = g.driver
+
+    cypher = """
+        // Episode already exists from add_episode — just resolve it
+        MATCH (e:Episodic {group_id: $g, name: $name})
+
+        // Idempotent Ticker node keyed on symbol
+        MERGE (t:Ticker {symbol: $sym})
+            ON CREATE SET t.created_at = datetime(), t.source = 'crucix'
+        SET t.sector = $sector, t.industry = $industry, t.is_etf = $is_etf
+
+        // Sector node + IN_SECTOR edge
+        MERGE (s:Sector {name: $sector})
+            ON CREATE SET s.created_at = datetime()
+        MERGE (t)-[r:IN_SECTOR]->(s)
+            ON CREATE SET r.created_at = datetime(), r.source = 'fmp'
+
+        // Tie the episode to the ticker so qid-crucix entity / sector
+        // queries see ideas attached to the tickers they're about
+        MERGE (e)-[m:MENTIONS]->(t)
+            ON CREATE SET m.created_at = datetime(), m.source = 'crucix-layer-c'
+
+        RETURN count(r) AS n
+    """
+    async with driver.session() as sess:
+        r = await sess.run(
+            cypher, g=group_id, name=episode_name,
+            sym=sym, sector=meta["sector"], industry=meta["industry"], is_etf=bool(meta["is_etf"]),
+        )
+        row = await r.single()
+        return row["n"] if row else 0
+
+
+# --- TSDB archival for crucix_trade_ideas (FIN-1155) ---
+
+_ideas_table_ready = False
+
+_ENSURE_IDEAS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS crucix_trade_ideas (
+    time        TIMESTAMPTZ NOT NULL,
+    idea_name   TEXT        NOT NULL,
+    ticker      TEXT        NOT NULL,
+    direction   TEXT,
+    confidence  TEXT,
+    title       TEXT,
+    thesis      TEXT,
+    risk        TEXT,
+    horizon     TEXT,
+    signals     JSONB,
+    ingested_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (idea_name, time)
+);
+"""
+
+_INSERT_TRADE_IDEA_SQL = """
+INSERT INTO crucix_trade_ideas
+    (time, idea_name, ticker, direction, confidence,
+     title, thesis, risk, horizon, signals)
+VALUES
+    (%(time)s, %(idea_name)s, %(ticker)s, %(direction)s, %(confidence)s,
+     %(title)s, %(thesis)s, %(risk)s, %(horizon)s, %(signals)s)
+ON CONFLICT (idea_name, time) DO NOTHING;
+"""
+
+
+def _ensure_ideas_table() -> None:
+    global _ideas_table_ready
+    if _ideas_table_ready:
+        return
+    try:
+        with psycopg2.connect(TSDB_DSN) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute(_ENSURE_IDEAS_TABLE_SQL)
+                try:
+                    cur.execute(
+                        "SELECT create_hypertable('crucix_trade_ideas', 'time', "
+                        "if_not_exists => TRUE, migrate_data => TRUE)"
+                    )
+                except Exception:
+                    pass
+        _ideas_table_ready = True
+        print("[Bridge] crucix_trade_ideas table ready")
+    except Exception as e:
+        print(f"[Bridge] ensure_ideas_table failed: {e}")
+
+
+def _archive_idea_to_tsdb(idea: dict, name: str, ticker: str, ts: datetime) -> None:
+    _ensure_ideas_table()
+    direction = (idea.get("type") or idea.get("side") or idea.get("direction") or "").upper() or None
+    confidence = (idea.get("confidence") or "").upper() or None
+    thesis = idea.get("thesis") or idea.get("rationale") or None
+    risk = idea.get("risk")
+    if isinstance(risk, list):
+        risk = "; ".join(str(r) for r in risk)
+    risk = risk or None
+    signals = idea.get("signals") or None
+
+    try:
+        with psycopg2.connect(TSDB_DSN) as conn:
+            with conn.cursor() as cur:
+                cur.execute(_INSERT_TRADE_IDEA_SQL, {
+                    "time": ts,
+                    "idea_name": name,
+                    "ticker": ticker.upper(),
+                    "direction": direction,
+                    "confidence": confidence,
+                    "title": idea.get("title"),
+                    "thesis": thesis,
+                    "risk": risk,
+                    "horizon": idea.get("horizon"),
+                    "signals": json.dumps(signals) if signals else None,
+                })
+            conn.commit()
+        print(f"[Bridge] Archived idea {name} to TSDB")
+    except Exception as e:
+        print(f"[Bridge] TSDB archive failed for {name}: {e}")
+
+
+async def ingest_idea(idea: dict):
+    g = _get_graphiti()
+    narrative = idea_to_narrative(idea)
+
+    ts = idea.get("time") or idea.get("timestamp")
+    if isinstance(ts, str):
+        try:
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            ts = datetime.now(timezone.utc)
+    if not isinstance(ts, datetime):
+        ts = datetime.now(timezone.utc)
+
+    ticker = idea.get("ticker") or idea.get("symbol") or "UNK"
+    name = f"crucix_idea_{ticker}_{ts.strftime('%Y%m%d_%H%M%S')}"
+
+    await g.add_episode(
+        name=name,
+        episode_body=narrative,
+        source=EpisodeType.text,
+        source_description="Crucix trade idea",
+        reference_time=ts,
+        group_id=GROUP_ID,
+    )
+    stats["ideas_ingested"] = stats.get("ideas_ingested", 0) + 1
+    stats["last_idea"] = datetime.now(timezone.utc).isoformat()
+    print(f"[Bridge] Ingested idea {name}")
+
+    # Archive to TimescaleDB for durable columnar storage (FIN-1155).
+    _archive_idea_to_tsdb(idea, name, ticker, ts)
+
+    # Layer C — wire IN_SECTOR edge for the idea's own ticker. Failure is
+    # non-fatal; the episode is already in the graph.
+    try:
+        n_edges = await _link_sector_for_idea(GROUP_ID, name, ticker)
+        if n_edges:
+            print(f"[Bridge] Linked IN_SECTOR for {ticker} on {name}")
+    except Exception as e:
+        print(f"[Bridge] sector-link error for {name}: {e}")
+
+
+async def ingest_sweep(sweep: dict):
+    global last_sweep_time
+    g = _get_graphiti()
     narrative = sweep_to_narrative(sweep)
     sweep_time = sweep.get("time", datetime.now(timezone.utc))
     if not hasattr(sweep_time, "tzinfo"):
@@ -152,7 +441,7 @@ async def ingest_sweep(sweep: dict):
 
     ts_str = sweep_time.strftime("%Y%m%d_%H%M%S") if hasattr(sweep_time, "strftime") else str(int(time.time()))
 
-    await graphiti.add_episode(
+    await g.add_episode(
         name=f"crucix_sweep_{ts_str}",
         episode_body=narrative,
         source=EpisodeType.text,
@@ -189,14 +478,12 @@ def poll_loop():
         sweeps = poll_tsdb()
         if sweeps:
             print(f"[Bridge] Found {len(sweeps)} new sweeps")
-            loop = asyncio.new_event_loop()
             for sweep in sweeps:
                 try:
-                    loop.run_until_complete(ingest_sweep(sweep))
+                    _submit(ingest_sweep(sweep)).result(timeout=600)
                 except Exception as e:
                     print(f"[Bridge] Ingest error: {e}")
                     stats["errors"] += 1
-            loop.close()
 
         for _ in range(POLL_INTERVAL):
             if not running:
@@ -223,26 +510,59 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def _ingest_endpoint(self, handler):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body)
+            _submit(handler(payload)).result(timeout=600)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True}).encode())
+        except Exception as e:
+            print(f"[Bridge] {self.path} ingest error: {e}")
+            stats["errors"] += 1
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+
     def do_POST(self):
         if self.path == "/ingest":
+            self._ingest_endpoint(ingest_sweep)
+        elif self.path == "/ideas":
+            # Async path: parse body, ack 202 immediately, ingest in background.
+            # Each idea triggers a Haiku entity-extraction pass which can take
+            # 30-60s, so we never want the HTTP caller blocking that long.
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             try:
-                sweep = json.loads(body)
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(ingest_sweep(sweep))
-                loop.close()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"ok": True}).encode())
+                payload = json.loads(body)
             except Exception as e:
-                print(f"[Bridge] Webhook ingest error: {e}")
-                stats["errors"] += 1
-                self.send_response(500)
+                self.send_response(400)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
+                self.wfile.write(json.dumps({"error": f"bad json: {e}"}).encode())
+                return
+
+            ideas = payload.get("ideas") if isinstance(payload, dict) and "ideas" in payload else (
+                payload if isinstance(payload, list) else [payload]
+            )
+
+            def _worker(items):
+                for idea in items:
+                    try:
+                        _submit(ingest_idea(idea)).result(timeout=600)
+                    except Exception as e:
+                        print(f"[Bridge] /ideas worker error on {idea.get('ticker','?')}: {e}")
+                        stats["errors"] += 1
+
+            Thread(target=_worker, args=(ideas,), daemon=True, name="IdeasWorker").start()
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"accepted": True, "count": len(ideas)}).encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -267,9 +587,17 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    # Start poll thread
-    poll_thread = Thread(target=poll_loop, daemon=True, name="CrucixPoll")
-    poll_thread.start()
+    # Spin up the dedicated Graphiti event loop thread before any worker
+    # tries to submit work to it.
+    _start_worker_loop()
+
+    # Start poll thread (skipped when BRIDGE_DISABLE_POLL=true — event-
+    # driven /ideas + /ingest path is the default now)
+    if DISABLE_POLL:
+        print("[Bridge] Poll loop disabled (BRIDGE_DISABLE_POLL=true)")
+    else:
+        poll_thread = Thread(target=poll_loop, daemon=True, name="CrucixPoll")
+        poll_thread.start()
 
     # Start HTTP server (webhook + health)
     server = HTTPServer(("0.0.0.0", HTTP_PORT), BridgeHandler)
