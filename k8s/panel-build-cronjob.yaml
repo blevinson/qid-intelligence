@@ -1,0 +1,79 @@
+# FIN-1145 / QIDP-231: panel v1.1 daily build (07:00 UTC — after daily bars land)
+# Full cold rebuild: run panel_build.py --cold-rebuild as a one-shot Job.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: panel-build
+  namespace: qid
+  labels:
+    app: panel-build
+    component: equity-panel
+spec:
+  # 07:00 UTC daily — Databento daily bars typically land by 06:30 UTC.
+  schedule: "0 7 * * 1-5"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 3600
+      template:
+        metadata:
+          labels:
+            app: panel-build
+            component: equity-panel
+        spec:
+          imagePullSecrets:
+            - name: ghcr-pull
+          restartPolicy: OnFailure
+          containers:
+            - name: panel-build
+              image: ghcr.io/blevinson/qid-intelligence-bridge:latest
+              imagePullPolicy: Always
+              command:
+                - python
+                - /app/scripts/panel_build.py
+              env:
+                - name: MINIO_ENDPOINT
+                  value: "minio.qid.svc.cluster.local:9000"
+                - name: MINIO_SECURE
+                  value: "false"
+                - name: QID_EQUITY_BUCKET
+                  value: "qid-equity"
+                - name: MINIO_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: minio-credentials
+                      key: access-key
+                - name: MINIO_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: minio-credentials
+                      key: secret-key
+                - name: QID_DB_HOST
+                  value: "qid-tsdb-rw.qid.svc.cluster.local"
+                - name: QID_DB_PORT
+                  value: "5432"
+                - name: QID_DB_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: dbname
+                - name: QID_DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: username
+                - name: QID_DB_PASS
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: password
+              resources:
+                requests:
+                  cpu: 500m
+                  memory: 4Gi
+                limits:
+                  cpu: 2
+                  memory: 8Gi
