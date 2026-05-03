@@ -1,5 +1,10 @@
 FROM python:3.11-slim
 
+# Auto-links the GHCR package to this repo on next push, so the workflow's
+# GITHUB_TOKEN gets push rights without needing a PAT (GHCR_TOKEN). Once
+# linked, the PAT becomes optional.
+LABEL org.opencontainers.image.source=https://github.com/blevinson/qid-intelligence
+
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
