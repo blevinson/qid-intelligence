@@ -9,7 +9,6 @@ RUN pip install --no-cache-dir \
     requests>=2.31.0
 
 COPY backend/crucix_bridge.py .
-COPY backend/scripts/benzinga_analyst_ingest.py scripts/
 COPY backend/scripts/polymarket_ingest.py scripts/
 
 EXPOSE 8090

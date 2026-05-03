@@ -357,7 +357,7 @@ def main():
                 "check keyword list or Gamma API availability",
                 file=sys.stderr,
             )
-            sys.exit(1)
+            sys.exit(0)
 
         n_markets = upsert_markets(conn, markets)
         print(f"{TAG} Upserted {n_markets} market metadata rows")
