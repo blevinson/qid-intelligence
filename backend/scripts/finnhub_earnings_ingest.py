@@ -96,6 +96,12 @@ def upsert_earnings(conn, records, panel_symbols):
         print("[finnhub_earnings_ingest] No panel-universe earnings to upsert")
         return 0
 
+    seen = {}
+    for r in filtered:
+        key = (r["symbol"], r["date"])
+        seen[key] = r
+    filtered = list(seen.values())
+
     values = [
         (
             r["symbol"],
