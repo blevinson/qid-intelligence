@@ -6,8 +6,11 @@ RUN pip install --no-cache-dir \
     graphiti-core>=0.28.0 \
     neo4j>=5.26.0 \
     psycopg2-binary>=2.9.0 \
-    requests>=2.31.0
+    requests>=2.31.0 \
+    httpx>=0.27.0 \
+    claude-agent-sdk>=0.1
 
+COPY backend/llm.py .
 COPY backend/crucix_bridge.py .
 COPY backend/scripts/polymarket_ingest.py scripts/
 
