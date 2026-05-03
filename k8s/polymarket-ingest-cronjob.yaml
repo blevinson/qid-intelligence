@@ -1,0 +1,63 @@
+# FIN-1108 / QIDP-242: Polymarket geopolitical-theme price snapshot ingest
+# Phase 1: read-only, no auth, no wallet, no trading.
+# Runs hourly; mirrors FIN-1070/1071/1072 CronJob conventions.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: polymarket-ingest
+  namespace: qid
+  labels:
+    app: polymarket-ingest
+    component: crucix
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels:
+            app: polymarket-ingest
+            component: crucix
+        spec:
+          imagePullSecrets:
+            - name: ghcr-pull
+          restartPolicy: OnFailure
+          containers:
+            - name: ingest
+              image: ghcr.io/blevinson/qid-intelligence-bridge:latest
+              command:
+                - python
+                - /app/scripts/polymarket_ingest.py
+              imagePullPolicy: Always
+              env:
+                - name: QID_DB_HOST
+                  value: "qid-tsdb-rw.qid.svc.cluster.local"
+                - name: QID_DB_PORT
+                  value: "5432"
+                - name: QID_DB_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: dbname
+                - name: QID_DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: username
+                - name: QID_DB_PASS
+                  valueFrom:
+                    secretKeyRef:
+                      name: qid-tsdb-app
+                      key: password
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
