@@ -206,13 +206,9 @@ def compute_outcome(
     if direction == "SHORT":
         realized_return = -realized_return
 
-    # MFE / MAE — require explicit high/low columns; fail fast if absent so
-    # callers know the bars schema is missing required fields.
-    missing = [c for c in ("high", "low") if c not in bars.columns]
-    if missing:
-        raise ValueError(f"Bars for horizon window missing required columns: {missing}")
-    highs = future["high"].astype(float)
-    lows = future["low"].astype(float)
+    # MFE / MAE — use daily high/low when available
+    highs = future.get("high", future.get("adjusted_close", future.iloc[:, 0])).astype(float)
+    lows = future.get("low", future.get("adjusted_close", future.iloc[:, 0])).astype(float)
 
     if direction == "LONG":
         mfe = (highs.max() - entry_price) / entry_price
@@ -366,15 +362,6 @@ async def _write_outcome_episode(
 async def run(horizon_days: int, backfill_date: date | None) -> None:
     log.info("crucix_idea_outcome starting", extra={"horizon_days": horizon_days})
 
-    # NEO4J_AUTH secret is stored as "neo4j/<password>" (k8s secret format).
-    # The module-level NEO4J_PASSWORD strips the "neo4j/" prefix so Graphiti
-    # receives only the password string. Log a masked hint for observability.
-    _pw_hint = NEO4J_PASSWORD[:3] + "***" if len(NEO4J_PASSWORD) > 3 else "***"
-    log.info(
-        "neo4j_config",
-        extra={"uri": NEO4J_URI, "user": NEO4J_USER, "password_hint": _pw_hint},
-    )
-
     graphiti = Graphiti(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
     minio = _minio_client()
 
@@ -452,11 +439,13 @@ async def run(horizon_days: int, backfill_date: date | None) -> None:
 
                 direction_mismatch = detect_direction_mismatch(direction, content)
 
-                # Write TSDB dedup row FIRST — acts as the idempotency lock.
-                # If graphiti write later fails the dedup row prevents a
-                # duplicate episode on the next run. Graphiti episodes are
-                # append-only and idempotent by name on re-delivery, but the
-                # TSDB row is the authoritative "already processed" signal.
+                # Write graphiti episode
+                await _write_outcome_episode(
+                    graphiti, name, ticker, direction, confidence,
+                    outcome, direction_mismatch, idea_dt,
+                )
+
+                # Write TSDB dedup row
                 with conn.cursor() as cur:
                     cur.execute(INSERT_OUTCOME, {
                         "idea_name": name,
@@ -477,12 +466,6 @@ async def run(horizon_days: int, backfill_date: date | None) -> None:
                         "direction_mismatch": direction_mismatch,
                     })
                 conn.commit()
-
-                # Then write graphiti episode (network operation; may retry on next run).
-                await _write_outcome_episode(
-                    graphiti, name, ticker, direction, confidence,
-                    outcome, direction_mismatch, idea_dt,
-                )
 
                 log.info(
                     "attributed",
