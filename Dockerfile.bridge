@@ -6,9 +6,15 @@ RUN pip install --no-cache-dir \
     graphiti-core>=0.28.0 \
     neo4j>=5.26.0 \
     psycopg2-binary>=2.9.0 \
-    requests>=2.31.0
+    requests>=2.31.0 \
+    minio>=7.2.0 \
+    duckdb>=0.10.0 \
+    numpy>=1.26.0 \
+    pandas>=2.2.0 \
+    pyarrow>=15.0.0
 
 COPY backend/crucix_bridge.py .
+COPY backend/scripts/panel_build.py scripts/
 COPY backend/scripts/polymarket_ingest.py scripts/
 COPY backend/scripts/finnhub_earnings_ingest.py scripts/
 COPY backend/scripts/sec_cik_ticker_ingest.py scripts/
