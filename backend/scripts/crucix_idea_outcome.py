@@ -154,7 +154,7 @@ def _minio_client() -> Minio:
 
 def load_bars(minio: Minio, ticker: str) -> pd.DataFrame | None:
     """Load daily OHLCV bars for ticker from MinIO. Returns None if absent."""
-    key = f"bars/{ticker}.parquet"
+    key = f"bars/ohlcv-1d/{ticker}.parquet"
     try:
         resp = minio.get_object(QID_EQUITY_BUCKET, key)
         try:
