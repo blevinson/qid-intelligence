@@ -173,6 +173,78 @@ def _load_universe_metadata(conn) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Crucix idea counts (FIN-1584 / TFARM-99)
+# ---------------------------------------------------------------------------
+
+def _fetch_crucix_idea_counts(conn, start: date, end: date) -> pd.DataFrame:
+    """Return per-ticker daily idea counts from crucix_trade_ideas.
+
+    Loads [start-6d, end] to cover the 7-day rolling window for all panel
+    dates in [start, end]. Returns a DataFrame with columns:
+        ticker, dt, n_ideas_24h, n_ideas_7d
+    where dt is a Python date within [start, end].
+
+    On query failure or empty table, returns an empty DataFrame so the caller
+    can fall back to 0-filling.
+    """
+    load_start = start - timedelta(days=6)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    ticker,
+                    (time AT TIME ZONE 'UTC')::date AS idea_date,
+                    COUNT(*) AS n_ideas
+                FROM crucix_trade_ideas
+                WHERE time >= %s AND time < %s
+                GROUP BY ticker, (time AT TIME ZONE 'UTC')::date
+                """,
+                (load_start, end + timedelta(days=1)),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        log.warning("Failed to fetch crucix idea counts: %s", exc)
+        return pd.DataFrame(columns=["ticker", "dt", "n_ideas_24h", "n_ideas_7d"])
+
+    if not rows:
+        return pd.DataFrame(columns=["ticker", "dt", "n_ideas_24h", "n_ideas_7d"])
+
+    daily = pd.DataFrame([dict(r) for r in rows])
+    daily["idea_date"] = pd.to_datetime(daily["idea_date"]).dt.date
+    daily["n_ideas"] = daily["n_ideas"].astype(int)
+
+    # Pivot to (calendar_day × ticker) for rolling; fill missing days with 0.
+    pivot = (
+        daily
+        .pivot_table(index="idea_date", columns="ticker", values="n_ideas", fill_value=0)
+        .sort_index()
+    )
+    all_days: list[date] = list(pd.date_range(load_start, end).date)
+    pivot = pivot.reindex(all_days, fill_value=0)
+
+    n_ideas_24h_df = pivot.copy()                        # same-day count
+    n_ideas_7d_df = pivot.rolling(7, min_periods=1).sum()
+
+    panel_days = [d for d in all_days if start <= d <= end]
+
+    def _melt_to_long(df: pd.DataFrame, col_name: str) -> pd.DataFrame:
+        sub = df.loc[panel_days].reset_index().rename(columns={"index": "dt"})
+        return sub.melt(id_vars="dt", var_name="ticker", value_name=col_name)
+
+    merged = _melt_to_long(n_ideas_24h_df, "n_ideas_24h").merge(
+        _melt_to_long(n_ideas_7d_df, "n_ideas_7d"), on=["dt", "ticker"]
+    )
+    merged["n_ideas_24h"] = merged["n_ideas_24h"].astype(int)
+    merged["n_ideas_7d"] = merged["n_ideas_7d"].astype(int)
+    log.info(
+        "Crucix idea counts: %d tickers with ideas across %d panel dates",
+        merged["ticker"].nunique(), merged["dt"].nunique(),
+    )
+    return merged.reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
 # Per-symbol feature computation
 # ---------------------------------------------------------------------------
 
@@ -478,6 +550,23 @@ def build_panel(
     log.info("Assembling cross-sectional panel ...")
     full_panel = pd.concat(all_feature_dfs, ignore_index=True)
     full_panel = full_panel.sort_values(["dt", "symbol"]).reset_index(drop=True)
+
+    # Populate crucix idea counts (FIN-1584 / TFARM-99)
+    log.info("Fetching crucix idea counts from TSDB ...")
+    idea_counts = _fetch_crucix_idea_counts(db_conn, start, end)
+    if not idea_counts.empty:
+        counts_24h = idea_counts.set_index(["dt", "ticker"])["n_ideas_24h"].to_dict()
+        counts_7d = idea_counts.set_index(["dt", "ticker"])["n_ideas_7d"].to_dict()
+        keys = list(zip(full_panel["dt"], full_panel["symbol"]))
+        full_panel["n_ideas_24h"] = [counts_24h.get(k, 0) for k in keys]
+        full_panel["n_ideas_7d"] = [counts_7d.get(k, 0) for k in keys]
+    else:
+        # No ideas in range (empty table or new environment) — fill 0 so the
+        # breakout overlay skip-guard (notna().any()) activates correctly once
+        # crucix ideas start arriving.
+        full_panel["n_ideas_24h"] = 0
+        full_panel["n_ideas_7d"] = 0
+        log.warning("No crucix ideas found for %s → %s; n_ideas columns set to 0", start, end)
 
     # Determine canonical column order
     canonical_cols = _canonical_columns()
