@@ -229,7 +229,7 @@ def _fetch_crucix_idea_counts(conn, start: date, end: date) -> pd.DataFrame:
     panel_days = [d for d in all_days if start <= d <= end]
 
     def _melt_to_long(df: pd.DataFrame, col_name: str) -> pd.DataFrame:
-        sub = df.loc[panel_days].reset_index().rename(columns={"index": "dt"})
+        sub = df.loc[panel_days].reset_index().rename(columns={"idea_date": "dt"})
         return sub.melt(id_vars="dt", var_name="ticker", value_name=col_name)
 
     merged = _melt_to_long(n_ideas_24h_df, "n_ideas_24h").merge(
