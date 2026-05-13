@@ -73,7 +73,7 @@ TSDB_DSN = os.environ.get("QID_TSDB_DSN", (
     f"password={os.environ.get('QID_DB_PASS', '')}"
 ))
 
-BARS_PREFIX = "bars"
+BARS_PREFIX = "bars/ohlcv-1d"
 PANEL_PREFIX = "panel/v1"
 UNIVERSE_KEY = "universe/snapshot.json"
 
