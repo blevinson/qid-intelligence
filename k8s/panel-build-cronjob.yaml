@@ -45,12 +45,12 @@ spec:
                   valueFrom:
                     secretKeyRef:
                       name: minio-credentials
-                      key: access-key
+                      key: MINIO_ACCESS_KEY
                 - name: MINIO_SECRET_KEY
                   valueFrom:
                     secretKeyRef:
                       name: minio-credentials
-                      key: secret-key
+                      key: MINIO_SECRET_KEY
                 - name: QID_DB_HOST
                   value: "qid-tsdb-rw.qid.svc.cluster.local"
                 - name: QID_DB_PORT
