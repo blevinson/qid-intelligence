@@ -403,10 +403,10 @@ def _compute_symbol_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # 1. bb_squeeze_ratio = (BB_width / SMA20) / (KC_width / EMA20)
     #    BB_width  = (upper_bb - lower_bb) = 4 * std20
-    #    KC_width  = (upper_kc - lower_kc) = 4 * ATR14
+    #    KC_width  = (upper_kc - lower_kc) = 2 × 1.5 × ATR14 = 3 * ATR14 (per QIDP-231)
     #    ratio < 1.0 → Bollinger Bands fit inside Keltner Channel (squeeze)
     bb_width = 4.0 * std20
-    kc_width = 4.0 * atr14
+    kc_width = 3.0 * atr14
     out["bb_squeeze_ratio"] = (bb_width / sma20.replace(0, np.nan)) / (
         kc_width / ema20.replace(0, np.nan)
     )
