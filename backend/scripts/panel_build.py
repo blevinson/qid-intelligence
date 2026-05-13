@@ -260,7 +260,7 @@ def _compute_symbol_features(df: pd.DataFrame) -> pd.DataFrame:
     Returns a DataFrame with one row per date for this symbol.
     All features are strictly trailing (no leak).
     """
-    df = df.sort_values("date").reset_index(drop=True).copy()
+    df = df.sort_values("dt").reset_index(drop=True).copy()
 
     close = df["close"].astype(float)
     open_ = df["open"].astype(float)
@@ -269,7 +269,7 @@ def _compute_symbol_features(df: pd.DataFrame) -> pd.DataFrame:
     volume = df["volume"].astype(float)
 
     out = pd.DataFrame(index=df.index)
-    out["dt"] = pd.to_datetime(df["date"]).dt.date
+    out["dt"] = pd.to_datetime(df["dt"]).dt.date
     out["open"] = open_
     out["high"] = high
     out["low"] = low
@@ -474,8 +474,8 @@ def _load_all_bars(
         df = _read_parquet_from_minio(client, key)
         if df is None or df.empty:
             continue
-        df["date"] = pd.to_datetime(df["date"]).dt.date
-        df = df[(df["date"] >= load_start) & (df["date"] <= end)].copy()
+        df["dt"] = pd.to_datetime(df["dt"]).dt.date
+        df = df[(df["dt"] >= load_start) & (df["dt"] <= end)].copy()
         if df.empty:
             continue
         symbol_bars[sym] = df
