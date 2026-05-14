@@ -18,6 +18,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from threading import Thread
 
 import psycopg2
@@ -46,6 +47,10 @@ TSDB_DSN = os.environ.get("QID_TSDB_DSN", (
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", None)
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-5.4-mini")
+# Max seconds to wait for a single Graphiti add_episode call. GraphitiEmit can
+# block on Neo4j or OpenAI; without a timeout the HTTP server thread stalls and
+# the liveness probe kills the container (FIN-2008).
+GRAPHITI_TIMEOUT = int(os.environ.get("GRAPHITI_TIMEOUT_SECONDS", "30"))
 
 SWEEP_QUERY = """
 SELECT time, regime, regime_reasons, suppress, bias_direction, threshold,
@@ -152,13 +157,16 @@ async def ingest_sweep(sweep: dict):
 
     ts_str = sweep_time.strftime("%Y%m%d_%H%M%S") if hasattr(sweep_time, "strftime") else str(int(time.time()))
 
-    await graphiti.add_episode(
-        name=f"crucix_sweep_{ts_str}",
-        episode_body=narrative,
-        source=EpisodeType.text,
-        source_description="Crucix macro intelligence sweep",
-        reference_time=sweep_time,
-        group_id=GROUP_ID,
+    await asyncio.wait_for(
+        graphiti.add_episode(
+            name=f"crucix_sweep_{ts_str}",
+            episode_body=narrative,
+            source=EpisodeType.text,
+            source_description="Crucix macro intelligence sweep",
+            reference_time=sweep_time,
+            group_id=GROUP_ID,
+        ),
+        timeout=GRAPHITI_TIMEOUT,
     )
     stats["sweeps_ingested"] += 1
     stats["last_ingest"] = datetime.now(timezone.utc).isoformat()
@@ -271,8 +279,12 @@ def main():
     poll_thread = Thread(target=poll_loop, daemon=True, name="CrucixPoll")
     poll_thread.start()
 
-    # Start HTTP server (webhook + health)
-    server = HTTPServer(("0.0.0.0", HTTP_PORT), BridgeHandler)
+    # Use a threading server so POST /ingest (slow Graphiti call) never blocks
+    # GET /health. Each request gets its own thread (FIN-2008).
+    class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+
+    server = _ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), BridgeHandler)
     server.timeout = 1
 
     print(f"[Bridge] Ready. Listening on :{HTTP_PORT}")
