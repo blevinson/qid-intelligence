@@ -17,12 +17,14 @@ import re
 import signal
 import sys
 import time
+import uuid as uuidlib
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from threading import Thread
 
 import psycopg2
+from neo4j import AsyncGraphDatabase
 from graphiti_core import Graphiti
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.llm_client.config import LLMConfig
@@ -75,7 +77,8 @@ ORDER BY time ASC
 # them, so every coroutine must run on the SAME loop. The threaded HTTP server
 # and the poll thread dispatch onto it via run_coroutine_threadsafe.
 BRIDGE_LOOP = None      # asyncio loop running forever in a background thread (set in main)
-_GRAPHITI = None        # singleton Graphiti client, built once on BRIDGE_LOOP
+_GRAPHITI = None        # singleton Graphiti client (sweeps), built once on BRIDGE_LOOP
+_NEO4J_DRIVER = None     # neo4j async driver for direct idea writes (no LLM), on BRIDGE_LOOP
 last_sweep_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
 stats = {
     "sweeps_ingested": 0,
@@ -174,6 +177,11 @@ async def _make_graphiti() -> Graphiti:
     return _build_graphiti()
 
 
+async def _make_neo4j():
+    """Build the neo4j async driver on BRIDGE_LOOP (its I/O binds to this loop)."""
+    return AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+
+
 def _run_on_loop(coro, timeout: float):
     """Submit a coroutine to the shared BRIDGE_LOOP from any thread and block for it.
     All graphiti calls funnel through here so they share one event loop."""
@@ -223,8 +231,8 @@ async def ingest_sweep(sweep: dict, g: Graphiti):
     print(f"[Bridge] Ingested sweep {ts_str}: regime={sweep.get('regime')}, VIX={sweep.get('vix')}, WTI={sweep.get('wti')}")
 
 
-async def ingest_idea(idea: dict, g: Graphiti):
-    """Ingest a single crucix trade idea as a JSON episode.
+async def ingest_idea(idea: dict):
+    """Ingest a single crucix trade idea as a JSON Episodic node (direct write).
 
     Crucix POSTs ideas (see crucix/lib/graphiti_emit.mjs) shaped like:
         {time, title, type, ticker, confidence, rationale, risk, horizon,
@@ -251,7 +259,7 @@ async def ingest_idea(idea: dict, g: Graphiti):
     ts_str = ref_time.strftime("%Y%m%d_%H%M%S")
     name = f"crucix_idea_{ticker}_{ts_str}"
 
-    body = json.dumps({
+    body_obj = {
         "type":          direction,          # LONG|SHORT|HEDGE|WATCH|AVOID (never IDEA_OUTCOME)
         "ticker":        ticker,
         "direction":     direction,          # downstream reads `direction`
@@ -262,22 +270,37 @@ async def ingest_idea(idea: dict, g: Graphiti):
         "title":         idea.get("title", ""),
         "shares_per_1k": idea.get("shares_per_1k"),
         "signals":       idea.get("signals", []),
-    })
+    }
+    # Carry the P2 grounding-scorer fields when present (node ran scoreIdeas) so
+    # the archive/outcome loop can bucket outcomes by grounding tier.
+    for k in ("evidence_score", "evidence_tier", "grounding", "llm_confidence", "short_balance_flag"):
+        if idea.get(k) is not None:
+            body_obj[k] = idea.get(k)
+    body = json.dumps(body_obj)
 
-    await asyncio.wait_for(
-        g.add_episode(
-            name=name,
-            episode_body=body,
-            source=EpisodeType.json,
-            source_description="Crucix trade idea",
-            reference_time=ref_time,
-            group_id=GROUP_ID,
-        ),
-        timeout=GRAPHITI_TIMEOUT,
+    # Direct neo4j write — replicate graphiti's Episodic schema WITHOUT the
+    # expensive add_episode LLM entity-extraction (which hangs/times out on rich
+    # idea bodies in-container). The archive reads e.content and the outcome loop
+    # reads the body; neither needs extracted entities. Instant + reliable.
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cypher = (
+        "MERGE (e:Episodic {name: $name, group_id: $gid}) "
+        "ON CREATE SET e.uuid = $uuid "
+        "SET e.content = $content, e.source = 'json', "
+        "e.source_description = 'Crucix trade idea', "
+        "e.created_at = datetime($created_at), e.valid_at = datetime($valid_at), "
+        "e.entity_edges = coalesce(e.entity_edges, [])"
     )
+    async def _write():
+        async with _NEO4J_DRIVER.session() as sess:
+            await sess.run(
+                cypher, name=name, gid=GROUP_ID, uuid=str(uuidlib.uuid4()),
+                content=body, created_at=now_iso, valid_at=ref_time.isoformat(),
+            )
+    await asyncio.wait_for(_write(), timeout=30)
     stats["ideas_ingested"] += 1
-    stats["last_ingest"] = datetime.now(timezone.utc).isoformat()
-    print(f"[Bridge] Ingested idea {name}: {direction} {ticker} conf={idea.get('confidence')}")
+    stats["last_ingest"] = now_iso
+    print(f"[Bridge] Ingested idea {name}: {direction} {ticker} ev={idea.get('evidence_score')}")
 
 
 _idea_gate: "asyncio.Semaphore | None" = None
@@ -302,7 +325,7 @@ async def _ingest_idea_safe(idea: dict):
     The gate processes ideas one-at-a-time (see _get_idea_gate)."""
     async with _get_idea_gate():
         try:
-            await ingest_idea(idea, _GRAPHITI)
+            await ingest_idea(idea)
         except Exception as e:
             print(f"[Bridge] Idea ingest error: {e!r}")
             stats["errors"] += 1
@@ -420,7 +443,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global running, BRIDGE_LOOP, _GRAPHITI
+    global running, BRIDGE_LOOP, _GRAPHITI, _NEO4J_DRIVER
     stats["started_at"] = datetime.now(timezone.utc).isoformat()
 
     print(f"[Bridge] Crucix Intelligence Bridge starting")
@@ -443,8 +466,16 @@ def main():
     # ingest work (poll thread + HTTP handlers) dispatches here via _run_on_loop.
     BRIDGE_LOOP = asyncio.new_event_loop()
     Thread(target=BRIDGE_LOOP.run_forever, daemon=True, name="BridgeLoop").start()
-    _GRAPHITI = asyncio.run_coroutine_threadsafe(_make_graphiti(), BRIDGE_LOOP).result(timeout=60)
-    print("[Bridge] Graphiti client ready on persistent loop")
+    # Ideas write directly to neo4j (no LLM) — this driver is the critical path.
+    _NEO4J_DRIVER = asyncio.run_coroutine_threadsafe(_make_neo4j(), BRIDGE_LOOP).result(timeout=30)
+    print("[Bridge] Neo4j driver ready (direct idea writes)")
+    # Graphiti is only used by the sweep path (/ingest); best-effort so a graphiti
+    # build failure (claude CLI/creds) never blocks idea delivery.
+    try:
+        _GRAPHITI = asyncio.run_coroutine_threadsafe(_make_graphiti(), BRIDGE_LOOP).result(timeout=60)
+        print("[Bridge] Graphiti client ready on persistent loop")
+    except Exception as e:
+        print(f"[Bridge] Graphiti client unavailable (sweeps disabled): {e!r}")
 
     # Start poll thread — unless disabled. The TSDB->graphiti sweep mirror is a
     # legacy path that re-ingests the entire sweep history on startup (last-seen
